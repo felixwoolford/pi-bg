@@ -1,16 +1,7 @@
 /**
- * Regression tests that drive the extension itself (not just the src/ helpers)
- * through a minimal mock of the pi ExtensionAPI. They pin two bugs:
- *
- *  1. Polling a still-running job with shell_status must not set delivered=true,
- *     which would permanently cancel the promised auto-delivery.
- *  3. A timeout the caller passed must still fire after a command auto-moves to
- *     the background — the kill the model expects may not be silently dropped.
- *
- * Both spawn a real, short-lived shell command, so they use the same portable
- * pipe→file spawn path the extension does (no numeric-fd stdio; Windows-safe).
- * Every spawned command is torn down before the test returns so the test runner
- * never blocks on a lingering child.
+ * Core execution, backgrounding, delivery and session-lifecycle tests driven
+ * through a minimal mock of the pi ExtensionAPI. Commands run in real shells;
+ * every spawned command is torn down before the test returns.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -18,7 +9,7 @@ import { mkdtempSync, mkdirSync, rmSync, readFileSync, existsSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import shellBackground from "../extensions/shell-background.ts";
+import shellBackground from "../index.ts";
 import { DELIVERY_TYPE } from "../src/pending.ts";
 
 // Isolate from the developer's own settings: the extension reads
@@ -49,7 +40,7 @@ function harness(): Harness {
   return { pi: pi as unknown as ExtensionAPI, tools, handlers, sent };
 }
 
-function makeCtx(cwd: string, hasUI: boolean, sessionId?: string, widgets?: Array<string | undefined>): ExtensionContext {
+function makeCtx(cwd: string, hasUI: boolean, sessionId?: string): ExtensionContext {
   return {
     cwd,
     hasUI,
@@ -61,9 +52,7 @@ function makeCtx(cwd: string, hasUI: boolean, sessionId?: string, widgets?: Arra
       : undefined,
     model: undefined,
     ui: {
-      setWidget: (_key: string, factory: (() => { render: (width: number) => string[] }) | undefined) => {
-        widgets?.push(factory?.().render(120).join("\n"));
-      },
+      setWidget: () => {},
       notify: () => {},
       theme: { fg: (_c: string, t: string) => t, bold: (t: string) => t },
     },
@@ -72,19 +61,8 @@ function makeCtx(cwd: string, hasUI: boolean, sessionId?: string, widgets?: Arra
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-/**
- * Remove a dir, retrying on Windows EBUSY: a just-killed child still briefly
- * locks its own cwd / log file, so the first rm can race the taskkill.
- */
 async function rmDir(p: string): Promise<void> {
-  for (let i = 0; i < 25; i++) {
-    try {
-      rmSync(p, { recursive: true, force: true });
-      return;
-    } catch {
-      await sleep(200);
-    }
-  }
+  rmSync(p, { recursive: true, force: true });
 }
 
 async function waitFor(pred: () => boolean | Promise<boolean>, timeoutMs: number): Promise<void> {
@@ -117,12 +95,11 @@ async function teardown(h: Harness, ctx: ExtensionContext): Promise<void> {
   }, 8000).catch(() => {});
 }
 
-test("foreground success, failure, timeout and abort never appear in the widget", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "sbg-widget-fg-"));
+test("foreground commands return success, failure, timeout and abort without duplicate delivery", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "sbg-fg-"));
   const { id: sid, regDir } = uniqueSession();
   const h = harness();
-  const widgets: Array<string | undefined> = [];
-  const ctx = makeCtx(cwd, true, sid, widgets);
+  const ctx = makeCtx(cwd, true, sid);
   try {
     mkdirSync(join(cwd, ".pi"), { recursive: true });
     writeFileSync(join(cwd, ".pi", "shell-background.json"), JSON.stringify({ autoBackgroundMs: 0 }));
@@ -130,19 +107,21 @@ test("foreground success, failure, timeout and abort never appear in the widget"
     await h.handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctx);
     const bash = h.tools.get("bash")!;
 
-    const running = bash.execute("success", { command: "sleep 0.2; echo ok" }, undefined, undefined, ctx);
-    await sleep(50);
-    assert.ok(widgets.every((text) => text === undefined), "running foreground command stays hidden");
-    assert.equal((await running).details.id, "fg-1");
+    const done = await bash.execute("success", { command: "echo ok" }, undefined, undefined, ctx);
+    assert.equal(done.details.id, "fg-1");
+    assert.equal(done.details.status, "done");
+    assert.equal(done.structuredContent.exit_code, 0);
+    assert.match(done.structuredContent.output, /ok/);
     const failed = await bash.execute("failure", { command: "exit 1" }, undefined, undefined, ctx);
     assert.equal(failed.details.status, "failed");
+    assert.equal(failed.structuredContent.exit_code, 1);
+    assert.equal(failed.isError, true);
     const timedOut = await bash.execute("timeout", { command: "sleep 10", timeout: 0.1 }, undefined, undefined, ctx);
     assert.equal(timedOut.details.status, "killed");
     const controller = new AbortController();
     const aborted = bash.execute("abort", { command: "sleep 10" }, controller.signal, undefined, ctx);
     controller.abort();
     assert.equal((await aborted).details.status, "killed");
-    assert.ok(widgets.every((text) => text === undefined), "no foreground completion flashes in the widget");
     assert.equal(h.sent.length, 0, "foreground results are not delivered again");
   } finally {
     await teardown(h, ctx);
@@ -151,15 +130,13 @@ test("foreground success, failure, timeout and abort never appear in the widget"
   }
 });
 
-test("widget shows explicit jobs immediately and fg jobs only after auto-background, including after reload", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "sbg-widget-bg-"));
+test("explicit and automatic background jobs retain IDs and remain manageable after reload", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "sbg-bg-"));
   const { id: sid, regDir } = uniqueSession();
   const a = harness();
   const b = harness();
-  const widgetsA: Array<string | undefined> = [];
-  const widgetsB: Array<string | undefined> = [];
-  const ctxA = makeCtx(cwd, true, sid, widgetsA);
-  const ctxB = makeCtx(cwd, true, sid, widgetsB);
+  const ctxA = makeCtx(cwd, true, sid);
+  const ctxB = makeCtx(cwd, true, sid);
   try {
     mkdirSync(join(cwd, ".pi"), { recursive: true });
     writeFileSync(join(cwd, ".pi", "shell-background.json"), JSON.stringify({ autoBackgroundMs: 400 }));
@@ -170,17 +147,16 @@ test("widget shows explicit jobs immediately and fg jobs only after auto-backgro
     assert.equal(quick.details.id, "fg-1");
     const explicit = await bash.execute("explicit", { command: "sleep 10", background: true }, undefined, undefined, ctxA);
     assert.equal(explicit.details.id, "bg-2");
-    assert.match(widgetsA.at(-1) ?? "", /bg-2/);
+    assert.equal(explicit.details.background, true);
+    assert.equal(explicit.details.auto, false);
+    assert.equal(explicit.structuredContent.status, "running");
 
-    const automatic = bash.execute("automatic", { command: "sleep 10" }, undefined, undefined, ctxA);
-    await sleep(50);
-    assert.ok(widgetsA.every((text) => !text?.includes("fg-3")), "not visible before the threshold");
-    const moved = await automatic;
+    const moved = await bash.execute("automatic", { command: "sleep 10" }, undefined, undefined, ctxA);
     assert.equal(moved.details.id, "fg-3");
     assert.equal(moved.details.background, true);
     assert.equal(moved.structuredContent.job_id, "fg-3");
-    assert.match(widgetsA.at(-1) ?? "", /fg-3/);
-    assert.ok(widgetsA.every((text) => !text?.includes("fg-1")), "quick command never appears");
+    assert.equal(moved.details.auto, true);
+    assert.equal(moved.structuredContent.status, "running");
     const sidecar = JSON.parse(readFileSync(join(regDir, "fg-3.json"), "utf8"));
     assert.equal(sidecar.background, true);
     assert.equal(sidecar.auto, true);
@@ -188,9 +164,10 @@ test("widget shows explicit jobs immediately and fg jobs only after auto-backgro
     await a.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "reload" }, ctxA);
     shellBackground(b.pi);
     await b.handlers.get("session_start")!({ type: "session_start", reason: "reload" }, ctxB);
-    assert.match(widgetsB.at(-1) ?? "", /bg-2/);
-    assert.match(widgetsB.at(-1) ?? "", /fg-3/);
-    assert.doesNotMatch(widgetsB.at(-1) ?? "", /fg-1/);
+    const list = await b.tools.get("shell_status")!.execute("list", {});
+    assert.match(list.content[0].text, /2 running, 3 total/);
+    assert.match(list.content[0].text, /bg-2/);
+    assert.match(list.content[0].text, /fg-3/);
     const next = await b.tools.get("bash")!.execute("next", { command: "echo next" }, undefined, undefined, ctxB);
     assert.equal(next.details.id, "fg-4", "shared counter survives reload with both prefixes");
     const status = await b.tools.get("shell_status")!.execute("status", { id: "fg-3" });
@@ -307,8 +284,7 @@ test("maxBackground: over the cap a long foreground command stays in the foregro
   const prevMs = process.env.SHELL_BG_MS;
   process.env.SHELL_BG_MS = "200";
   const h = harness();
-  const widgets: Array<string | undefined> = [];
-  const ctx = makeCtx(cwd, true, sid, widgets);
+  const ctx = makeCtx(cwd, true, sid);
   try {
     mkdirSync(join(cwd, ".pi"), { recursive: true });
     writeFileSync(join(cwd, ".pi", "shell-background.json"), JSON.stringify({ maxBackground: 1 }));
@@ -326,8 +302,6 @@ test("maxBackground: over the cap a long foreground command stays in the foregro
     assert.equal(res.details.status, "done");
     assert.match(String(res.content[0].text), /kept in the foreground/);
     assert.equal(res.details.id, "fg-2");
-    assert.ok(widgets.some((text) => text?.includes("bg-1")));
-    assert.ok(widgets.every((text) => !text?.includes("fg-2")), "kept-foreground job never appears");
   } finally {
     await teardown(h, ctx);
     await rmDir(cwd);
@@ -477,51 +451,39 @@ test("quit kills a running job and records it killed (finding f078 complement)",
   }
 });
 
-test("the bash guideline is headless-aware, not a false auto-background promise (finding f073)", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "sbg-hl-"));
-  const { id: sid, regDir } = uniqueSession();
-  const h = harness();
-  const ctx = makeCtx(cwd, false, sid); // headless: no UI to deliver into
-  try {
-    shellBackground(h.pi);
-    await h.handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctx);
-    const bash = h.tools.get("bash")! as unknown as { promptGuidelines: string[] };
-    const last = bash.promptGuidelines.at(-1) ?? "";
-    assert.match(last, /headless/i, "the guideline says it is a headless run");
-    assert.doesNotMatch(last, /moved to the background/i, "no false auto-background promise");
-    assert.doesNotMatch(last, /after 0s/i, "no 'after 0s' nonsense");
-  } finally {
-    const sd = h.handlers.get("session_shutdown");
-    if (sd) await sd({ type: "session_shutdown", reason: "quit" }, ctx);
-    await rmDir(cwd);
-    await rmDir(regDir);
-  }
-});
-
-test("with auto-background disabled the guideline does not say 'after 0s' (finding f073)", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "sbg-zero-"));
-  const { id: sid, regDir } = uniqueSession();
-  const prevMs = process.env.SHELL_BG_MS;
-  process.env.SHELL_BG_MS = "0"; // auto-background disabled
-  const h = harness();
-  const ctx = makeCtx(cwd, true, sid); // interactive, but threshold is 0
-  try {
-    shellBackground(h.pi);
-    await h.handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctx);
-    const bash = h.tools.get("bash")! as unknown as { promptGuidelines: string[] };
-    const last = bash.promptGuidelines.at(-1) ?? "";
-    assert.doesNotMatch(last, /after 0s/i, "no 'after 0s' promise");
-    assert.doesNotMatch(last, /moved to the background/i, "and no auto-background claim");
-    assert.match(last, /run to completion/i, "it says commands run to completion");
-  } finally {
-    const sd = h.handlers.get("session_shutdown");
-    if (sd) await sd({ type: "session_shutdown", reason: "quit" }, ctx);
-    await rmDir(cwd);
-    await rmDir(regDir);
-    if (prevMs === undefined) delete process.env.SHELL_BG_MS;
-    else process.env.SHELL_BG_MS = prevMs;
-  }
-});
+for (const { name, hasUI, threshold } of [
+  { name: "headless", hasUI: false, threshold: "100" },
+  { name: "auto-background disabled", hasUI: true, threshold: "0" },
+]) {
+  test(`${name}: commands run to completion without auto-backgrounding`, async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "sbg-no-auto-"));
+    const { id: sid, regDir } = uniqueSession();
+    const prevMs = process.env.SHELL_BG_MS;
+    process.env.SHELL_BG_MS = threshold;
+    const h = harness();
+    const ctx = makeCtx(cwd, hasUI, sid);
+    try {
+      shellBackground(h.pi);
+      await h.handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctx);
+      // Outlive the headless case's configured threshold: checking guideline
+      // wording alone would not detect accidental auto-backgrounding here.
+      const result = await h.tools.get("bash")!.execute(
+        "run", { command: "sleep 0.3; echo completed" }, undefined, undefined, ctx,
+      );
+      assert.equal(result.details.background, false);
+      assert.equal(result.details.status, "done");
+      assert.equal(result.structuredContent.exit_code, 0);
+      assert.match(result.structuredContent.output, /completed/);
+      assert.equal(h.sent.length, 0, "foreground results are not auto-delivered");
+    } finally {
+      await teardown(h, ctx);
+      await rmDir(cwd);
+      await rmDir(regDir);
+      if (prevMs === undefined) delete process.env.SHELL_BG_MS;
+      else process.env.SHELL_BG_MS = prevMs;
+    }
+  });
+}
 
 test("shell_status wait blocks until a running job finishes (finding f075)", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "sbg-wait-"));

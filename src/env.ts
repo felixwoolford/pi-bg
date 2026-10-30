@@ -69,15 +69,12 @@ export function buildEnv(
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...NON_INTERACTIVE_DEFAULTS, ...base, ...NON_INTERACTIVE_FORCED };
 
-  // PATH is case-insensitive on Windows; find the real key so we do not create a
-  // second, ignored "PATH" alongside an inherited "Path". Only prepend when the
-  // bin dir is not already on it (mirrors pi's getShellEnv hasBinDir check).
+  // Only prepend when the bin dir is not already on PATH.
   if (binDir) {
-    const pathKey = Object.keys(env).find((k) => k.toLowerCase() === "path") ?? "PATH";
-    const current = env[pathKey] ?? "";
+    const current = env.PATH ?? "";
     const entries = current.split(delimiter).filter(Boolean);
     if (!entries.includes(binDir)) {
-      env[pathKey] = [binDir, current].filter(Boolean).join(delimiter);
+      env.PATH = [binDir, current].filter(Boolean).join(delimiter);
     }
   }
 

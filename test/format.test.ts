@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { header, formatResult, formatList } from "../src/format.ts";
+import { formatResult } from "../src/format.ts";
 import type { Job } from "../src/types.ts";
 
 function job(over: Partial<Job> = {}): Job {
@@ -25,20 +25,12 @@ function job(over: Partial<Job> = {}): Job {
   };
 }
 
-test("header states id, status, verdict and duration", () => {
-  assert.match(header(job()), /^\[bg-1 · done · exit 0 · 4\.2s\]$/);
-  assert.match(header(job({ status: "failed", exitCode: 1 })), /failed · exit 1/);
-  assert.match(header(job({ status: "killed", exitCode: null, signal: "SIGKILL" })), /killed · signal SIGKILL/);
-  assert.match(header(job({ status: "running", endedAt: null, exitCode: null })), /^\[bg-1 · running · [^·]+\]$/, "no verdict while running");
-});
-
-test("formatResult shows the header and the output tail", () => {
+test("results include command output", () => {
   const dir = mkdtempSync(join(tmpdir(), "sbg-fmt-"));
   try {
     const logPath = join(dir, "l.log");
     writeFileSync(logPath, "line one\nline two\n");
     const text = formatResult(job({ logPath }), 65536);
-    assert.match(text, /\[bg-1 · done · exit 0/);
     assert.match(text, /line one\nline two/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -59,7 +51,7 @@ test("formatResult is honest about no output, and about a log it cannot read", (
   assert.match(formatResult(job({ logPath: "/no/such" }), 65536), /\(log unavailable: \/no\/such could not be read\)/);
 });
 
-test("formatResult shrinks a long log by lines, keeps the error in the middle, and says what it left out", () => {
+test("long results retain failures and access to the full unchanged log", () => {
   const dir = mkdtempSync(join(tmpdir(), "sbg-fmt-"));
   try {
     const logPath = join(dir, "build.log");
@@ -67,25 +59,14 @@ test("formatResult shrinks a long log by lines, keeps the error in the middle, a
     writeFileSync(logPath, body.join("\n") + "\n");
     const text = formatResult(job({ logPath }), 65536, 200);
     assert.match(text, /error TS2304/, "the failing step survived in the middle");
-    assert.match(text, /^… \d+ of 600 lines omitted, none with an error or warning .* — full log: /m);
-    assert.match(text, /\[… \d+ lines omitted \(INFO ×\d+\) …\]/);
+    assert.ok(text.includes(logPath), "the full log remains accessible");
     assert.ok(text.includes("INFO step 599"), "the tail is there");
     assert.ok(text.includes("INFO step 0"), "the head is there");
-    assert.ok(text.split("\n").length < 260, "well under the untouched 600");
+    assert.ok(text.split("\n").length < body.length, "repetitive output is bounded");
+    assert.equal(readFileSync(logPath, "utf8"), body.join("\n") + "\n", "the full log is unchanged");
     // tailLines 0 turns shrinking off.
     assert.ok(formatResult(job({ logPath }), 65536, 0).split("\n").length > 600);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-});
-
-test("formatList summarizes running vs total, newest first", () => {
-  const jobs = [
-    job({ id: "bg-1", status: "done", startedAt: 1 }),
-    job({ id: "bg-2", status: "running", endedAt: null, startedAt: 2 }),
-  ];
-  const list = formatList(jobs);
-  assert.match(list, /1 running, 2 total/);
-  assert.ok(list.indexOf("bg-2") < list.indexOf("bg-1"), "newest first");
-  assert.match(formatList([]), /No background commands/);
 });

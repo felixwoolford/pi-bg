@@ -18,12 +18,6 @@ test("buildEnv prepends the bin dir to PATH, once", () => {
   assert.equal(already.PATH, `/agent/bin${delimiter}/usr/bin`);
 });
 
-test("buildEnv finds a case-insensitive PATH key (Windows 'Path')", () => {
-  const env = buildEnv({}, "C:\\agent\\bin", { Path: "C:\\Windows" });
-  assert.equal(env.Path, `C:\\agent\\bin${delimiter}C:\\Windows`);
-  assert.equal(env.PATH, undefined, "did not create a second, ignored PATH key");
-});
-
 test("buildEnv sets the PI_* session vars from ctx", () => {
   const env = buildEnv(
     {

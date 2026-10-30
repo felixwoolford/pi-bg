@@ -38,20 +38,20 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, statSync, rmSync } from "node:fs";
 
-import { JobRegistry, isAlive } from "../src/registry.ts";
-import { spawnToFile } from "../src/spawn.ts";
-import { killTree } from "../src/kill.ts";
-import { readTail } from "../src/tail.ts";
-import { buildEnv } from "../src/env.ts";
-import { DEFAULT_SETTINGS, resolveSettings, type ShellBgSettings } from "../src/config.ts";
-import { backgroundedResult, deliveryMessage, DELIVERY_TYPE } from "../src/pending.ts";
-import { formatResult, formatList, header } from "../src/format.ts";
-import { sanitizeOutput } from "../src/sanitize.ts";
-import { readFull } from "../src/tail.ts";
-import { STRUCTURED_OUTPUT_MAX_BYTES, bashOutputSchema, buildStructured, type BashStructured } from "../src/structured.ts";
-import { buildWidgetLines } from "../src/widget.ts";
-import { isFinished } from "../src/types.ts";
-import type { Job } from "../src/types.ts";
+import { JobRegistry, isAlive } from "./src/registry.ts";
+import { spawnToFile } from "./src/spawn.ts";
+import { killTree } from "./src/kill.ts";
+import { readTail } from "./src/tail.ts";
+import { buildEnv } from "./src/env.ts";
+import { DEFAULT_SETTINGS, resolveSettings, type ShellBgSettings } from "./src/config.ts";
+import { backgroundedResult, deliveryMessage, DELIVERY_TYPE } from "./src/pending.ts";
+import { formatResult, formatList, header } from "./src/format.ts";
+import { sanitizeOutput } from "./src/sanitize.ts";
+import { readFull } from "./src/tail.ts";
+import { STRUCTURED_OUTPUT_MAX_BYTES, bashOutputSchema, buildStructured, type BashStructured } from "./src/structured.ts";
+import { buildWidgetLines } from "./src/widget.ts";
+import { isFinished } from "./src/types.ts";
+import type { Job } from "./src/types.ts";
 
 type UiContext = ExtensionContext;
 type AnyTool = { name: string; execute: (...a: never[]) => unknown; [k: string]: unknown };
@@ -157,10 +157,7 @@ export default function shellBackground(pi: ExtensionAPI) {
   /** Shell + args, reusing pi's resolution; command rides in argv (not stdin). */
   function shellArgv(): { shell: string; args: string[] } {
     const cfg = getShellConfig();
-    // Our stdio has stdin ignored, so a stdin command transport (legacy WSL)
-    // cannot receive the command — fall back to -c, which every bash accepts.
-    const args = cfg.commandTransport === "stdin" ? ["-c"] : [...cfg.args];
-    return { shell: cfg.shell, args };
+    return { shell: cfg.shell, args: [...cfg.args] };
   }
 
   function stopWidgetTimer(): void {
@@ -739,8 +736,8 @@ export default function shellBackground(pi: ExtensionAPI) {
       try {
         rmSync(registry.dir(), { recursive: true, force: true });
       } catch {
-        // Windows can hold the log write stream open (EBUSY); the 7-day age
-        // sweep on a later session_start collects whatever is left behind.
+        // Best-effort cleanup: the 7-day age sweep on a later session_start
+        // collects whatever is left behind.
       }
     }
     stopWidgetTimer();

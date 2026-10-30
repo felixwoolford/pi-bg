@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readTail, countLines, DEFAULT_TAIL_BYTES } from "../src/tail.ts";
+import { readTail, DEFAULT_TAIL_BYTES } from "../src/tail.ts";
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), "sbg-tail-"));
@@ -56,10 +56,4 @@ test("readTail drops a leading partial UTF-8 char at the cut", () => {
 
 test("readTail on a missing file is empty and says so; an unreadable log is not a silent command", () => {
   assert.deepEqual(readTail("/no/such/file/xyz", 100), { text: "", truncated: false, bytes: 0, missing: true });
-});
-
-test("countLines ignores blank lines", () => {
-  assert.equal(countLines("a\n\nb\n"), 2);
-  assert.equal(countLines(""), 0);
-  assert.equal(countLines("   \n\t\n"), 0);
 });

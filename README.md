@@ -39,13 +39,13 @@ When a backgrounded command finishes in an **interactive** session, its result i
 
 ## How it works
 
-Each command is spawned with its stdout and stderr piped into a single log file, drained on every chunk so nothing is lost no matter how much it prints, and finalized only after the pipes end (with a short grace so a daemonized grandchild that holds a handle open cannot truncate the tail). The process is spawned detached (POSIX) and `unref`'d so a running job never holds the host open, and killed as a whole process tree — `taskkill /T` on Windows, a process-group signal on POSIX — on timeout, abort, `shell_kill`, or session shutdown.
+Each command inherits a single log file descriptor for stdout and stderr, so output goes straight to disk without parent-owned pipes or drain timers. The process is spawned detached and `unref`'d so a running job never holds the host open, and killed as a whole POSIX process group on timeout, abort, `shell_kill`, or session shutdown.
 
-Shell resolution reuses pi's own `getShellConfig` (Git Bash on Windows, `/bin/bash` then `sh` on Unix) and the environment is rebuilt the way pi's bash builds it (managed bin dir on PATH, `PI_SESSION_ID`/`PI_SESSION_FILE`/`PI_PROVIDER`/`PI_MODEL`/`PI_REASONING_LEVEL` from the session), so a backgrounded command behaves identically to a foreground one.
+Shell resolution reuses pi's own `getShellConfig` (`/bin/bash` then `sh`) and the environment is rebuilt the way pi's bash builds it (managed bin dir on PATH, `PI_SESSION_ID`/`PI_SESSION_FILE`/`PI_PROVIDER`/`PI_MODEL`/`PI_REASONING_LEVEL` from the session), so a backgrounded command behaves identically to a foreground one.
 
 Jobs are tracked in memory and mirrored to a sidecar under the temp dir, keyed by the pi **session id** — so two sessions in the same directory never see or kill each other's jobs, and the id is stable across a `/reload`. A `/reload` does **not** kill background jobs: pi hands the same host process to a fresh instance, which adopts every still-running job from the sidecars and delivers each one when it finishes (exactly once). Every other way a session ends — quit, or switching to another session — kills its jobs and their whole process trees. Each record also carries the host pid that spawned it: a `running` record left by a different (or crashed) host is surfaced as `orphaned` and never treated as live, so its pid — which may since belong to something unrelated — is never signalled. A job whose process has died is reconciled rather than shown as forever-running, this session's dir is removed on a clean exit, and stray dirs from a crash are swept after seven days.
 
-There are **no runtime dependencies**, and it works on Linux, macOS and Windows.
+There are **no runtime dependencies**. Supported platforms are Linux, macOS, and other POSIX systems.
 
 ## Settings
 

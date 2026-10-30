@@ -24,14 +24,17 @@
   "engines": {
     "node": ">=22.19.0"
   },
+  "os": [
+    "!win32"
+  ],
   "files": [
-    "extensions",
+    "index.ts",
     "src",
     "README.md"
   ],
   "pi": {
     "extensions": [
-      "./extensions/shell-background.ts"
+      "./index.ts"
     ]
   },
   "scripts": {

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
@@ -11,7 +11,7 @@ import { killTree } from "../src/kill.ts";
 /** Resolve a real shell the same way the extension does. */
 function shell(): { shell: string; args: string[] } {
   const c = getShellConfig();
-  return { shell: c.shell, args: c.commandTransport === "stdin" ? ["-c"] : [...c.args] };
+  return { shell: c.shell, args: [...c.args] };
 }
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -24,8 +24,22 @@ test("spawnToFile writes output to the log and resolves the exit code", async ()
     assert.ok(s.pid && s.pid > 0, "has a pid");
     const { code } = await s.exit;
     assert.equal(code, 0);
-    await sleep(50);
     assert.match(readTail(log, 65536).text, /hello\nworld/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("stdout and stderr are complete at exit even when output exceeds a pipe buffer", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sbg-output-"));
+  try {
+    const log = join(dir, "l.log");
+    const { shell: sh, args } = shell();
+    const command = "i=0; while [ \"$i\" -lt 4096 ]; do printf 'stdout-%s\\n' \"$i\"; printf 'stderr-%s\\n' \"$i\" >&2; i=$((i + 1)); done";
+    const s = spawnToFile(sh, args, command, dir, process.env, log);
+    assert.equal((await s.exit).code, 0);
+    const expected = Array.from({ length: 4096 }, (_, i) => `stdout-${i}\nstderr-${i}\n`).join("");
+    assert.equal(readFileSync(log, "utf8"), expected);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
