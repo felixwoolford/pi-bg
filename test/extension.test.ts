@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import shellBackground from "../index.ts";
-import { DELIVERY_TYPE } from "../src/pending.ts";
+import { DELIVERY_TYPE } from "../src/format.ts";
 
 // Isolate from the developer's own settings: the extension reads
 // <agentDir>/shell-background.json, which would otherwise leak into every test

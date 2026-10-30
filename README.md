@@ -78,7 +78,7 @@ Use `.pi/shell-background.json` for project settings or `<agentDir>/shell-backgr
 - `maxBackground`: maximum simultaneously running background jobs. At capacity, explicit background requests are refused; foreground commands continue running without automatically backgrounding. Foreground runs do not count toward the limit.
 - `deliverResults`: whether finished background jobs automatically deliver their results.
 
-Invalid values fall back to defaults or are clamped with a warning. Unknown settings, including the removed `tailLines` setting, produce a warning.
+Invalid values fall back to defaults or are clamped with a warning. Unknown settings produce a warning.
 
 ## License
 

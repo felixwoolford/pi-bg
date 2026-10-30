@@ -4,9 +4,8 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
-import { spawnToFile } from "../src/spawn.ts";
+import { spawnToFile, killTree } from "../src/spawn.ts";
 import { readTail } from "../src/tail.ts";
-import { killTree } from "../src/kill.ts";
 
 /** Resolve a real shell the same way the extension does. */
 function shell(): { shell: string; args: string[] } {

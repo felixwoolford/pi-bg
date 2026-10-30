@@ -39,13 +39,11 @@ import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, statSync, rmSync } from "node:fs";
 
 import { JobRegistry, isAlive } from "./src/registry.ts";
-import { spawnToFile } from "./src/spawn.ts";
-import { killTree } from "./src/kill.ts";
+import { spawnToFile, killTree } from "./src/spawn.ts";
 import { readTail } from "./src/tail.ts";
 import { buildEnv } from "./src/env.ts";
 import { DEFAULT_SETTINGS, resolveSettings, type ShellBgSettings } from "./src/config.ts";
-import { backgroundedResult, deliveryMessage, DELIVERY_TYPE } from "./src/pending.ts";
-import { formatResult, formatList, header } from "./src/format.ts";
+import { backgroundedResult, deliveryMessage, DELIVERY_TYPE, formatResult, formatList, header } from "./src/format.ts";
 import { sanitizeOutput } from "./src/sanitize.ts";
 import { readFull } from "./src/tail.ts";
 import { STRUCTURED_OUTPUT_MAX_BYTES, bashOutputSchema, buildStructured, type BashStructured } from "./src/structured.ts";
