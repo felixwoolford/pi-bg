@@ -33,7 +33,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { tmpdir } from "node:os";
+import { constants as osConstants, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, statSync, rmSync } from "node:fs";
@@ -51,7 +51,7 @@ import { readFull } from "./src/tail.ts";
 import { STRUCTURED_OUTPUT_MAX_BYTES, bashOutputSchema, buildStructured, type BashStructured } from "./src/structured.ts";
 import { buildWidgetLines } from "./src/widget.ts";
 import { isFinished } from "./src/types.ts";
-import type { Job } from "./src/types.ts";
+import type { Execution, Job } from "./src/types.ts";
 
 type UiContext = ExtensionContext;
 type AnyTool = { name: string; execute: (...a: never[]) => unknown; [k: string]: unknown };
@@ -68,6 +68,8 @@ const WIDGET = "shell-bg";
 export default function shellBackground(pi: ExtensionAPI) {
   let settings: ShellBgSettings = DEFAULT_SETTINGS;
   let registry: JobRegistry | null = null;
+  // Only running foreground executions need private shutdown bookkeeping.
+  const foreground = new Set<Execution>();
   let lastUiCtx: UiContext | null = null;
   let widgetTimer: NodeJS.Timeout | null = null;
   // Set on a /reload shutdown: this (old) instance's processes are being handed
@@ -189,25 +191,25 @@ export default function shellBackground(pi: ExtensionAPI) {
 
   // ── run ────────────────────────────────────────────────────────────
 
-  function snapshot(job: Job): ToolResult {
+  function snapshot(job: Execution): ToolResult {
     const tail = readTail(job.logPath, settings.tailBytes);
     return {
       content: [{ type: "text", text: `${header(job)}\n${sanitizeOutput(tail.text).replace(/\n+$/, "") || "(no output yet)"}` }],
-      details: { id: job.id, status: job.status },
+      details: { status: job.status },
     };
   }
 
   /** The structured half of any result about a job: the whole log (bounded) plus status, for scripts. */
-  function structured(job: Job): BashStructured {
+  function structured(job: Execution): BashStructured {
     return buildStructured(job, readFull(job.logPath, STRUCTURED_OUTPUT_MAX_BYTES));
   }
 
-  function finished(job: Job): ToolResult {
+  function finished(job: Execution): ToolResult {
     return {
-      content: [{ type: "text", text: formatResult(job, settings.tailBytes, settings.tailLines) }],
-      details: { id: job.id, status: job.status, exitCode: job.exitCode, signal: job.signal, background: false },
+      content: [{ type: "text", text: formatResult(job, settings.tailBytes) }],
+      details: { status: job.status, exitCode: job.exitCode, signal: job.signal, background: false },
       structuredContent: structured(job),
-      isError: job.status === "failed",
+      isError: job.status !== "done",
     };
   }
 
@@ -218,7 +220,7 @@ export default function shellBackground(pi: ExtensionAPI) {
     pi.sendMessage(
       {
         customType: DELIVERY_TYPE,
-        content: deliveryMessage(job.id, formatResult(job, settings.tailBytes, settings.tailLines)),
+        content: deliveryMessage(job.id, formatResult(job, settings.tailBytes)),
         display: true,
         details: { id: job.id, status: job.status, exitCode: job.exitCode },
       },
@@ -307,192 +309,114 @@ export default function shellBackground(pi: ExtensionAPI) {
   ): Promise<ToolResult> {
     lastUiCtx = ctx;
     if (!registry) throw new Error("shell-background not initialized");
+    const owner = registry;
     const command = String(params.command ?? "").trim();
     if (!command) return { content: [{ type: "text", text: "Empty command." }], details: {}, isError: true };
+    // Match Pi's timeout validation and do not start an already-cancelled call.
+    if (params.timeout !== undefined && (!Number.isFinite(params.timeout) || params.timeout <= 0 || params.timeout * 1000 > 2_147_483_647)) {
+      throw new Error("Invalid timeout: must be positive, finite, and at most 2147483.647 seconds");
+    }
+    if (signal?.aborted) throw new Error("aborted");
 
-    // The cap bounds how many jobs may be alive, not whether a command runs:
-    // an explicit background request over it is refused (the model can still
-    // run the command in the foreground); an auto-background transition over
-    // it is skipped and the command simply stays in the foreground.
-    const liveOthers = (self?: string) => registry!.running().filter((j) => j.id !== self).length;
-    if (params.background && liveOthers() >= settings.maxBackground) {
-      const n = liveOthers();
+    const runningBackground = () => owner.running().length;
+    if (params.background && runningBackground() >= settings.maxBackground) {
+      const n = runningBackground();
       return {
-        content: [
-          {
-            type: "text",
-            text:
-              `${n} background command${n === 1 ? " is" : "s are"} already running (maxBackground = ${settings.maxBackground}). ` +
-              `shell_kill one you no longer need, wait for one with shell_status {id, wait}, or run this in the foreground without background:true.`,
-          },
-        ],
+        content: [{ type: "text", text:
+          `${n} background command${n === 1 ? " is" : "s are"} already running (maxBackground = ${settings.maxBackground}). ` +
+          `shell_kill one you no longer need, wait for one with shell_status {id, wait}, or run this in the foreground without background:true.` }],
         details: { running: n, limit: settings.maxBackground },
         isError: true,
       };
     }
 
-    const job = registry.create(command, ctx.cwd, params.background === true);
-    const { shell, args } = shellArgv();
-
+    const execution = owner.createExecution(command, ctx.cwd);
+    let job: Job | undefined;
     let spawned;
     try {
-      spawned = spawnToFile(shell, args, command, ctx.cwd, buildEnv(ctx, join(getAgentDir(), "bin")), job.logPath);
+      const { shell, args } = shellArgv();
+      spawned = spawnToFile(shell, args, command, ctx.cwd, buildEnv(ctx, join(getAgentDir(), "bin")), execution.logPath);
     } catch (err) {
-      job.status = "failed";
-      job.endedAt = Date.now();
-      registry.persist(job);
       return { content: [{ type: "text", text: `Failed to start: ${err instanceof Error ? err.message : String(err)}` }], details: {}, isError: true };
     }
-    job.pid = spawned.pid;
-    registry.persist(job);
-    renderWidget(ctx);
+    execution.pid = spawned.pid;
+    foreground.add(execution);
 
-    // Settle the job record the moment the process ends, whatever else happens.
     const settle = spawned.exit.then(({ code, signal: sig }) => {
-      if (job.status === "running") {
-        job.status = job.killedByUs ? "killed" : sig ? "killed" : code === 0 ? "done" : "failed";
+      foreground.delete(execution);
+      if (execution.status === "running") {
+        execution.status = execution.killedByUs || sig ? "killed" : code === 0 ? "done" : "failed";
       }
-      job.exitCode = code;
-      job.signal = sig;
-      job.endedAt = Date.now();
-      // Handed off on /reload: flush the final status to the sidecar for the new
-      // instance to read, but do not deliver or touch the stale UI ctx here.
-      if (handedOff) {
-        registry?.persist(job);
-        return;
+      execution.exitCode = code ?? (sig ? 128 + (osConstants.signals[sig] ?? 0) : 1);
+      execution.signal = sig;
+      execution.endedAt = Date.now();
+      if (job) {
+        owner.persist(job);
+        if (!handedOff) renderWidget();
       }
-      registry?.persist(job);
-      renderWidget();
     });
 
-    if (params.background) {
+    const kill = () => {
+      if (execution.status !== "running") return;
+      execution.killedByUs = true;
+      killTree(execution.pid);
+    };
+    // One deadline for the entire execution, including explicit background jobs
+    // and any later transition. Clear it on exit, not when the tool returns.
+    let timedOut = false;
+    const deadline = params.timeout === undefined ? undefined : setTimeout(() => {
+      timedOut = true;
+      kill();
+    }, params.timeout * 1000);
+    deadline?.unref();
+    void settle.then(() => clearTimeout(deadline));
+
+    const background = (auto: boolean): ToolResult => {
+      job = owner.register(execution, auto);
+      foreground.delete(execution);
+      renderWidget(ctx);
       scheduleDelivery(job, settle);
       const r = backgroundedResult({
         id: job.id,
         command,
-        elapsedMs: 0,
-        auto: false,
+        elapsedMs: auto ? Date.now() - execution.startedAt : 0,
+        auto,
         interactive: ctx.hasUI,
         collectWith: "shell_status",
       });
       return { content: [{ type: "text", text: r.text }], details: r.details, structuredContent: structured(job) };
-    }
+    };
+    if (params.background) return background(false);
 
-    // Foreground: race the process against the auto-background threshold, an
-    // optional timeout, and the turn's abort signal — streaming the tail.
-    const autoMs = effectiveAutoMs(ctx.hasUI);
-    const timers: NodeJS.Timeout[] = [];
-    const after = (ms: number, val: string) =>
-      new Promise<string>((res) => {
-        const t = setTimeout(() => res(val), ms);
-        t.unref?.();
-        timers.push(t);
-      });
-    const tick = setInterval(() => onUpdate?.(snapshot(job)), 1000);
-    tick.unref?.();
-
-    const abort = new Promise<string>((res) => {
-      if (!signal) return;
-      if (signal.aborted) res("abort");
-      else signal.addEventListener("abort", () => res("abort"), { once: true });
-    });
-
+    // No public job record while the call is still awaited. Cancellation and
+    // shutdown only need the private process handle, not a persisted job id.
+    const onAbort = () => kill();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    // Keep an awaited foreground call alive even though its child is unref'd.
+    const tick = setInterval(() => onUpdate?.(snapshot(execution)), 1000);
+    let autoTimer: NodeJS.Timeout | undefined;
     try {
-      const race: Array<Promise<string>> = [settle.then(() => "exit")];
-      if (params.timeout && params.timeout > 0) race.push(after(params.timeout * 1000, "timeout"));
-      if (signal) race.push(abort);
-
-      let outcome = await Promise.race(autoMs > 0 ? [...race, after(autoMs, "auto")] : race);
-
-      // Over the cap, the threshold passes without moving the command: it is
-      // never refused, it just keeps its foreground slot until it ends.
+      const autoMs = effectiveAutoMs(ctx.hasUI);
+      const exit = settle.then(() => "exit");
+      const outcome = autoMs > 0 ? await Promise.race([exit, new Promise<string>((resolve) => {
+        autoTimer = setTimeout(() => resolve("auto"), autoMs);
+      })]) : await exit;
       let keptForeground = false;
-      if (outcome === "auto" && liveOthers(job.id) >= settings.maxBackground) {
+      if (outcome === "auto" && execution.status === "running" && !timedOut && !signal?.aborted && !handedOff) {
+        if (runningBackground() < settings.maxBackground) return background(true);
         keptForeground = true;
-        outcome = await Promise.race(race);
       }
-
-      if (outcome === "exit") {
-        const r = finished(job);
-        if (keptForeground) {
-          r.content = [
-            {
-              type: "text",
-              text: `${r.content[0]?.text ?? ""}\n\n[kept in the foreground: ${settings.maxBackground} background commands were already running]`,
-            },
-          ];
-        }
-        return r;
-      }
-
-      if (outcome === "auto") {
-        job.background = true;
-        job.auto = true;
-        registry.persist(job);
-        renderWidget(ctx);
-        scheduleDelivery(job, settle);
-        // A timeout the caller set still applies once the command is in the
-        // background: schedule the kill for the time it has left so the deadline
-        // the model expects is honoured rather than silently dropped. This timer
-        // deliberately outlives the `finally` below, so it is not in `timers`.
-        if (params.timeout && params.timeout > 0) {
-          const remaining = params.timeout * 1000 - (Date.now() - job.startedAt);
-          const killAt = setTimeout(() => {
-            if (job.status !== "running") return;
-            job.killedByUs = true;
-            killTree(job.pid);
-          }, Math.max(0, remaining));
-          killAt.unref?.();
-        }
-        const r = backgroundedResult({
-          id: job.id,
-          command,
-          elapsedMs: Date.now() - job.startedAt,
-          auto: true,
-          interactive: ctx.hasUI,
-          collectWith: "shell_status",
-        });
-        return { content: [{ type: "text", text: r.text }], details: r.details, structuredContent: structured(job) };
-      }
-
-      // timeout or abort: stop the tree, let the record settle, report partial.
-      job.killedByUs = true;
-      killTree(job.pid);
-      // Give the tree time to actually die before reporting — up to killTree's
-      // own SIGKILL grace on a timeout, briefly on an abort so the turn ends.
-      const graceMs = outcome === "timeout" ? 3000 : 500;
-      await Promise.race([settle, after(graceMs, "gave-up")]);
-      if (outcome === "timeout" && job.status === "running") {
-        // Do not print "[killed]" under a still-"running" header: the signal is
-        // out but the process has not confirmed exit. Say so, and point at the
-        // status tool rather than claim a death we cannot see yet.
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                formatResult(job, settings.tailBytes, settings.tailLines) +
-                `\n\n[kill signal sent; process had not exited after 3s — shell_status ${job.id} to confirm]`,
-            },
-          ],
-          details: { id: job.id, status: job.status },
-          structuredContent: structured(job),
-          isError: true,
-        };
-      }
-      const note =
-        outcome === "timeout"
-          ? `\n\n[killed: exceeded the ${params.timeout}s timeout]`
-          : `\n\n[killed: the turn was aborted]`;
-      return {
-        content: [{ type: "text", text: formatResult(job, settings.tailBytes, settings.tailLines) + note }],
-        details: { id: job.id, status: job.status },
-        structuredContent: structured(job),
-        isError: true,
-      };
+      await settle;
+      const result = finished(execution);
+      if (timedOut) result.content[0]!.text += `\n\n[killed: exceeded the ${params.timeout}s timeout]`;
+      else if (signal?.aborted) result.content[0]!.text += "\n\n[killed: the turn was aborted]";
+      else if (keptForeground) result.content[0]!.text += `\n\n[kept in the foreground: ${settings.maxBackground} background commands were already running]`;
+      return result;
     } finally {
-      timers.forEach(clearTimeout);
+      clearTimeout(autoTimer);
       clearInterval(tick);
+      signal?.removeEventListener("abort", onAbort);
     }
   }
 
@@ -596,7 +520,7 @@ export default function shellBackground(pi: ExtensionAPI) {
         registry.persist(job);
       }
       return {
-        content: [{ type: "text", text: formatResult(job, settings.tailBytes, settings.tailLines) }],
+        content: [{ type: "text", text: formatResult(job, settings.tailBytes) }],
         details: { id: job.id, status: job.status, exitCode: job.exitCode },
         structuredContent: structured(job),
       };
@@ -712,6 +636,15 @@ export default function shellBackground(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
+    // Foreground calls have no public records to hand off. Cancel any still
+    // active calls; only registered background jobs survive a reload.
+    for (const execution of foreground) {
+      execution.killedByUs = true;
+      killTree(execution.pid);
+      execution.status = "killed";
+      execution.endedAt = Date.now();
+    }
+    foreground.clear();
     if (event.reason === "reload") {
       // Same host process, a fresh instance is coming right after: hand the jobs
       // off rather than kill them. This (old) instance's closures go quiet

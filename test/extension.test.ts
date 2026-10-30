@@ -5,7 +5,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, readdirSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -91,7 +91,7 @@ async function teardown(h: Harness, ctx: ExtensionContext): Promise<void> {
   if (!status) return;
   await waitFor(async () => {
     const list = await status.execute("teardown", {});
-    return /^0 running/.test(String(list.content[0].text));
+    return /^(?:0 running|No background commands)/.test(String(list.content[0].text));
   }, 8000).catch(() => {});
 }
 
@@ -108,7 +108,8 @@ test("foreground commands return success, failure, timeout and abort without dup
     const bash = h.tools.get("bash")!;
 
     const done = await bash.execute("success", { command: "echo ok" }, undefined, undefined, ctx);
-    assert.equal(done.details.id, "fg-1");
+    assert.equal(done.details.id, undefined);
+    assert.equal(done.structuredContent.job_id, undefined);
     assert.equal(done.details.status, "done");
     assert.equal(done.structuredContent.exit_code, 0);
     assert.match(done.structuredContent.output, /ok/);
@@ -123,6 +124,9 @@ test("foreground commands return success, failure, timeout and abort without dup
     controller.abort();
     assert.equal((await aborted).details.status, "killed");
     assert.equal(h.sent.length, 0, "foreground results are not delivered again");
+    const list = await h.tools.get("shell_status")!.execute("list", {});
+    assert.match(list.content[0].text, /No background commands/);
+    assert.deepEqual(readdirSync(regDir).filter((f) => f.endsWith(".json")), [], "no foreground sidecars");
   } finally {
     await teardown(h, ctx);
     await rmDir(cwd);
@@ -130,7 +134,7 @@ test("foreground commands return success, failure, timeout and abort without dup
   }
 });
 
-test("explicit and automatic background jobs retain IDs and remain manageable after reload", async () => {
+test("jobs register only on backgrounding, with independent counters that survive reload", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "sbg-bg-"));
   const { id: sid, regDir } = uniqueSession();
   const a = harness();
@@ -144,20 +148,22 @@ test("explicit and automatic background jobs retain IDs and remain manageable af
     await a.handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctxA);
     const bash = a.tools.get("bash")!;
     const quick = await bash.execute("quick", { command: "echo ok" }, undefined, undefined, ctxA);
-    assert.equal(quick.details.id, "fg-1");
+    assert.equal(quick.details.id, undefined);
     const explicit = await bash.execute("explicit", { command: "sleep 10", background: true }, undefined, undefined, ctxA);
-    assert.equal(explicit.details.id, "bg-2");
-    assert.equal(explicit.details.background, true);
+    assert.equal(explicit.details.id, "bg-1");
     assert.equal(explicit.details.auto, false);
-    assert.equal(explicit.structuredContent.status, "running");
 
-    const moved = await bash.execute("automatic", { command: "sleep 10" }, undefined, undefined, ctxA);
-    assert.equal(moved.details.id, "fg-3");
+    const moving = bash.execute("automatic", { command: "echo before; sleep 10" }, undefined, undefined, ctxA);
+    const before = await a.tools.get("shell_status")!.execute("before", {});
+    assert.match(before.content[0].text, /1 running, 1 total/);
+    assert.deepEqual(readdirSync(regDir).filter((f) => f.endsWith(".json")), ["bg-1.json"]);
+    const moved = await moving;
+    assert.equal(moved.details.id, "fg-1");
     assert.equal(moved.details.background, true);
-    assert.equal(moved.structuredContent.job_id, "fg-3");
+    assert.equal(moved.structuredContent.job_id, "fg-1");
     assert.equal(moved.details.auto, true);
-    assert.equal(moved.structuredContent.status, "running");
-    const sidecar = JSON.parse(readFileSync(join(regDir, "fg-3.json"), "utf8"));
+    assert.match(moved.structuredContent.output, /before/, "output from before the transition survives");
+    const sidecar = JSON.parse(readFileSync(join(regDir, "fg-1.json"), "utf8"));
     assert.equal(sidecar.background, true);
     assert.equal(sidecar.auto, true);
 
@@ -165,19 +171,96 @@ test("explicit and automatic background jobs retain IDs and remain manageable af
     shellBackground(b.pi);
     await b.handlers.get("session_start")!({ type: "session_start", reason: "reload" }, ctxB);
     const list = await b.tools.get("shell_status")!.execute("list", {});
-    assert.match(list.content[0].text, /2 running, 3 total/);
-    assert.match(list.content[0].text, /bg-2/);
-    assert.match(list.content[0].text, /fg-3/);
-    const next = await b.tools.get("bash")!.execute("next", { command: "echo next" }, undefined, undefined, ctxB);
-    assert.equal(next.details.id, "fg-4", "shared counter survives reload with both prefixes");
-    const status = await b.tools.get("shell_status")!.execute("status", { id: "fg-3" });
-    assert.equal(status.details.status, "running");
-    const killed = await b.tools.get("shell_kill")!.execute("kill", { id: "fg-3" });
-    assert.equal(killed.details.id, "fg-3", "fg IDs work with shell_kill too");
-    await waitFor(async () => (await b.tools.get("shell_status")!.execute("status", { id: "fg-3" })).details.status === "killed", 6000);
+    assert.match(list.content[0].text, /2 running, 2 total/);
+    assert.match(list.content[0].text, /bg-1/);
+    assert.match(list.content[0].text, /fg-1/);
+    const next = await b.tools.get("bash")!.execute("next", { command: "sleep 10", background: true }, undefined, undefined, ctxB);
+    assert.equal(next.details.id, "bg-2");
+    const nextAuto = await b.tools.get("bash")!.execute("next-auto", { command: "sleep 10" }, undefined, undefined, ctxB);
+    assert.equal(nextAuto.details.id, "fg-2");
+    const killed = await b.tools.get("shell_kill")!.execute("kill", { id: "fg-1" });
+    assert.equal(killed.details.id, "fg-1");
+    await waitFor(async () => (await b.tools.get("shell_status")!.execute("status", { id: "fg-1" })).details.status === "killed", 6000);
   } finally {
     await teardown(a, ctxA);
     await teardown(b, ctxB);
+    await rmDir(cwd);
+    await rmDir(regDir);
+  }
+});
+
+test("foreground executions stay private, do not consume the background cap, and are killed on shutdown", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "sbg-private-"));
+  const { id: sid, regDir } = uniqueSession();
+  const h = harness();
+  const ctx = makeCtx(cwd, false, sid);
+  let running: Promise<any> | undefined;
+  try {
+    mkdirSync(join(cwd, ".pi"));
+    writeFileSync(join(cwd, ".pi", "shell-background.json"), JSON.stringify({ maxBackground: 1 }));
+    shellBackground(h.pi);
+    await h.handlers.get("session_start")!({ type: "session_start" }, ctx);
+    const bash = h.tools.get("bash")!;
+    running = bash.execute("foreground", { command: "echo ready > ready; sleep 10" }, undefined, undefined, ctx);
+    await waitFor(() => existsSync(join(cwd, "ready")), 2000);
+    const list = await h.tools.get("shell_status")!.execute("list", {});
+    assert.match(list.content[0].text, /No background commands/);
+    assert.deepEqual(readdirSync(regDir).filter((f) => f.endsWith(".json")), []);
+    const background = await bash.execute("background", { command: "sleep 10", background: true }, undefined, undefined, ctx);
+    assert.equal(background.details.id, "bg-1", "foreground does not consume the background cap");
+    await h.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, ctx);
+    const stopped = await running;
+    assert.equal(stopped.details.status, "killed");
+    assert.equal(stopped.details.id, undefined);
+  } finally {
+    await teardown(h, ctx);
+    await running;
+    await rmDir(cwd);
+    await rmDir(regDir);
+  }
+});
+
+test("already-aborted calls and invalid timeouts do not start a command", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "sbg-cancelled-"));
+  const { id: sid, regDir } = uniqueSession();
+  const h = harness();
+  const ctx = makeCtx(cwd, false, sid);
+  try {
+    shellBackground(h.pi);
+    await h.handlers.get("session_start")!({ type: "session_start" }, ctx);
+    const bash = h.tools.get("bash")!;
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(bash.execute("aborted", { command: "touch unwanted" }, controller.signal, undefined, ctx), /aborted/);
+    for (const timeout of [0, -1, NaN, Infinity, 2147484]) {
+      await assert.rejects(bash.execute("invalid", { command: "touch unwanted", timeout }, undefined, undefined, ctx), /Invalid timeout/);
+    }
+    assert.equal(existsSync(join(cwd, "unwanted")), false);
+    assert.deepEqual(readdirSync(join(regDir, "logs")), [], "no process or log was started");
+  } finally {
+    await teardown(h, ctx);
+    await rmDir(cwd);
+    await rmDir(regDir);
+  }
+});
+
+test("explicit background jobs retain their timeout but detach from the turn's abort signal", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "sbg-explicit-timeout-"));
+  const { id: sid, regDir } = uniqueSession();
+  const h = harness();
+  const ctx = makeCtx(cwd, false, sid);
+  try {
+    shellBackground(h.pi);
+    await h.handlers.get("session_start")!({ type: "session_start" }, ctx);
+    const controller = new AbortController();
+    const started = await h.tools.get("bash")!.execute("background", { command: "sleep 10", background: true, timeout: 0.5 }, controller.signal, undefined, ctx);
+    controller.abort();
+    const status = h.tools.get("shell_status")!;
+    assert.equal((await status.execute("running", { id: started.details.id })).details.status, "running");
+    await waitFor(async () => (await status.execute("finished", { id: started.details.id })).details.status === "killed", 3000);
+    assert.equal((await status.execute("code", { id: started.details.id })).structuredContent.exit_code, 137);
+  } finally {
+    await teardown(h, ctx);
     await rmDir(cwd);
     await rmDir(regDir);
   }
@@ -301,7 +384,7 @@ test("maxBackground: over the cap a long foreground command stays in the foregro
     assert.equal(res.details.background, false, "not backgrounded");
     assert.equal(res.details.status, "done");
     assert.match(String(res.content[0].text), /kept in the foreground/);
-    assert.equal(res.details.id, "fg-2");
+    assert.equal(res.details.id, undefined);
   } finally {
     await teardown(h, ctx);
     await rmDir(cwd);
@@ -526,17 +609,17 @@ test("pi 0.99: results carry structuredContent for scripts — exit_code once fi
     assert.ok((bash as { outputSchema?: unknown }).outputSchema, "the tool declares its outputSchema");
 
     const done = await bash.execute("t1", { command: "echo structured-ok" }, undefined, undefined, ctx);
-    const sc = done.structuredContent as { output: string; exit_code?: number; status: string; job_id: string; truncated: boolean };
+    const sc = done.structuredContent as { output: string; exit_code?: number; status: string; job_id?: string; truncated: boolean };
     assert.match(sc.output, /structured-ok/);
     assert.equal(sc.exit_code, 0);
     assert.equal(sc.status, "done");
     assert.equal(sc.truncated, false);
-    assert.equal(sc.job_id, "fg-1");
+    assert.equal(sc.job_id, undefined);
 
     const bg = await bash.execute("t2", { command: "sleep 2", background: true }, undefined, undefined, ctx);
     const running = bg.structuredContent as { status: string; exit_code?: number; job_id: string };
     assert.equal(running.status, "running");
-    assert.equal(running.job_id, "bg-2");
+    assert.equal(running.job_id, "bg-1");
     assert.equal("exit_code" in running, false);
     const status = h.tools.get("shell_status")!;
     await waitFor(async () => (await status.execute("p", { id: running.job_id })).details.status !== "running", 6000);

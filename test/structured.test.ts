@@ -39,6 +39,8 @@ test("buildStructured mirrors pi's bash fields and adds status and job_id; exit_
   assert.equal("exit_code" in running, false);
   assert.equal(running.wall_time_seconds, 2);
   const cut = buildStructured(job({ status: "failed", exitCode: 1, logPath: "/l/bg-1.log" }), { content: "x", truncated: true, bytes: 9 });
+  const foreground = buildStructured({ ...job(), id: undefined, background: false }, { content: "out", truncated: false, bytes: 3 });
+  assert.equal("job_id" in foreground, false, "foreground executions have no public job id");
   assert.equal(cut.full_output_path, "/l/bg-1.log");
   assert.equal(cut.exit_code, 1);
 });

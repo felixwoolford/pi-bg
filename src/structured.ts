@@ -12,7 +12,7 @@
  * in which case `exit_code` is absent, which is how a script tells.
  */
 import { Type, type Static } from "typebox";
-import type { Job } from "./types.ts";
+import type { Execution } from "./types.ts";
 import type { FullOutput } from "./tail.ts";
 
 export const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
@@ -32,13 +32,13 @@ export const bashOutputSchema = Type.Object({
     Type.Literal("killed"),
     Type.Literal("orphaned"),
   ]),
-  job_id: Type.String({ description: "Pass to shell_status to collect or check a running command" }),
+  job_id: Type.Optional(Type.String({ description: "Present only after backgrounding; pass to shell_status to collect or check the job" })),
 });
 
 export type BashStructured = Static<typeof bashOutputSchema>;
 
 /** Build the structured value for a job from its full log; `now` only matters while it runs. */
-export function buildStructured(job: Job, full: FullOutput, now: number = Date.now()): BashStructured {
+export function buildStructured(job: Execution, full: FullOutput, now: number = Date.now()): BashStructured {
   const end = job.endedAt ?? now;
   return {
     output: full.content,
@@ -47,6 +47,6 @@ export function buildStructured(job: Job, full: FullOutput, now: number = Date.n
     ...(job.status !== "running" && typeof job.exitCode === "number" ? { exit_code: job.exitCode } : {}),
     wall_time_seconds: Math.round(Math.max(0, end - job.startedAt) / 100) / 10,
     status: job.status,
-    job_id: job.id,
+    ...(job.id ? { job_id: job.id } : {}),
   };
 }

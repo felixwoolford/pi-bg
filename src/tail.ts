@@ -110,9 +110,3 @@ export function readFull(path: string, maxBytes: number): FullOutput {
     closeSync(fd);
   }
 }
-
-/** Non-empty line count of a chunk of text. */
-export function countLines(text: string): number {
-  if (!text) return 0;
-  return text.split("\n").filter((l) => l.trim() !== "").length;
-}

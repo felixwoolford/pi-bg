@@ -4,7 +4,7 @@
  * with one improvement: a carriage return is resolved, not deleted. pi drops
  * the `\r` and keeps every progress frame's text, so a 2000-frame webpack bar
  * arrives as one line holding all 2000 frames; here only the last frame of
- * each line survives, which is what the terminal showed (see shrink.ts).
+ * each line survives, which is what the terminal showed.
  *
  * This package re-registers `bash`, and a job's log is captured raw on disk on
  * purpose (the detached spawn writes straight to a file; no in-process pipes).
@@ -16,7 +16,15 @@
  * vendored here verbatim.
  */
 
-import { collapseCarriageReturns } from "./shrink.ts";
+/** Keep the final non-empty redraw of each line, including ordinary CRLF lines. */
+function collapseCarriageReturns(text: string): string {
+  if (!text.includes("\r")) return text;
+  return text.split("\n").map((line) => {
+    let last = "";
+    for (const frame of line.split("\r")) if (frame) last = frame;
+    return last;
+  }).join("\n");
+}
 
 // Valid string terminator sequences are BEL, ESC\, and 0x9c
 const ST = "(?:\\u0007|\\u001B\\u005C|\\u009C)";

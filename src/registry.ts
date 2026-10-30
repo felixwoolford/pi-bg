@@ -1,5 +1,5 @@
 /**
- * Shell command records, in memory and mirrored to disk (including foreground runs).
+ * Background job records, in memory and mirrored to disk.
  *
  * The live Map is the source of truth while the session runs. Each job is also
  * written to a small JSON sidecar (atomically, temp + rename) so the status
@@ -13,7 +13,8 @@
  */
 import { mkdirSync, writeFileSync, renameSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Job } from "./types.ts";
+import { randomUUID } from "node:crypto";
+import type { Execution, Job } from "./types.ts";
 import { isRecord } from "./types.ts";
 
 export function isAlive(pid: number | null | undefined): boolean {
@@ -39,7 +40,7 @@ function isJob(v: unknown): v is Job {
 
 export class JobRegistry {
   private readonly jobs = new Map<string, Job>();
-  private counter = 0;
+  private counters = { bg: 0, fg: 0 };
   private readonly baseDir: string;
 
   constructor(baseDir: string) {
@@ -53,14 +54,9 @@ export class JobRegistry {
     return this.baseDir;
   }
 
-  logPathFor(id: string): string {
-    return join(this.baseDir, "logs", `${id}.log`);
-  }
-
-  create(command: string, cwd: string, background = false): Job {
-    const id = `${background ? "bg" : "fg"}-${++this.counter}`;
-    const job: Job = {
-      id,
+  /** Private execution state: no public id, counter allocation, or sidecar. */
+  createExecution(command: string, cwd: string): Execution {
+    return {
       command,
       cwd,
       pid: null,
@@ -68,14 +64,26 @@ export class JobRegistry {
       status: "running",
       exitCode: null,
       signal: null,
-      logPath: this.logPathFor(id),
+      logPath: join(this.baseDir, "logs", `${randomUUID()}.log`),
       startedAt: Date.now(),
       endedAt: null,
-      background,
+      background: false,
       auto: false,
       delivered: false,
     };
-    this.jobs.set(id, job);
+  }
+
+  /** Promote an execution without changing its process, log, or start time. */
+  register(execution: Execution, auto: boolean): Job {
+    if (execution.id) throw new Error("Execution is already registered");
+    const prefix = auto ? "fg" : "bg";
+    const job = Object.assign(execution, {
+      id: `${prefix}-${++this.counters[prefix]}`,
+      background: true,
+      auto,
+    });
+    this.jobs.set(job.id, job);
+    this.persist(job);
     return job;
   }
 
@@ -150,9 +158,14 @@ export class JobRegistry {
             job.endedAt = job.endedAt ?? Date.now();
           }
         }
-        this.jobs.set(job.id, job);
-        const n = Number(job.id.replace(/^(?:bg|fg)-/, ""));
-        if (Number.isFinite(n)) this.counter = Math.max(this.counter, n);
+        const match = /^(bg|fg)-(\d+)$/.exec(job.id);
+        if (match) {
+          const prefix = match[1] as "bg" | "fg";
+          this.counters[prefix] = Math.max(this.counters[prefix], Number(match[2]));
+        }
+        // Old foreground records are not background jobs. Keep them out of the
+        // public registry, but avoid reusing their ids when migrating.
+        if (job.background) this.jobs.set(job.id, job);
       } catch {
         // Skip a corrupt sidecar rather than fail the whole load.
       }

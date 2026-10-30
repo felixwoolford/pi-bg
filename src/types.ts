@@ -5,9 +5,9 @@
 
 export type JobStatus = "running" | "done" | "failed" | "killed" | "orphaned";
 
-export interface Job {
-  /** Session-monotonic id: bg-N for explicit background, fg-N for foreground starts. */
-  id: string;
+export interface Execution {
+  /** Assigned only when backgrounded: bg-N explicitly, fg-N automatically. */
+  id?: string;
   command: string;
   cwd: string;
   /** OS pid of the shell process; null before spawn or if spawn failed. */
@@ -37,6 +37,11 @@ export interface Job {
   delivered: boolean;
   /** Set when we killed it (timeout/abort/shell_kill), so exit reads as killed. */
   killedByUs?: boolean;
+}
+
+/** A registered background execution, with a public session-monotonic id. */
+export interface Job extends Execution {
+  id: string;
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
