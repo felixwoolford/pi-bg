@@ -68,19 +68,19 @@ export class JobRegistry {
       startedAt: Date.now(),
       endedAt: null,
       background: false,
-      auto: false,
+      fromForeground: false,
       delivered: false,
     };
   }
 
   /** Promote an execution without changing its process, log, or start time. */
-  register(execution: Execution, auto: boolean): Job {
+  register(execution: Execution, fromForeground: boolean): Job {
     if (execution.id) throw new Error("Execution is already registered");
-    const prefix = auto ? "fg" : "bg";
+    const prefix = fromForeground ? "fg" : "bg";
     const job = Object.assign(execution, {
       id: `${prefix}-${++this.counters[prefix]}`,
       background: true,
-      auto,
+      fromForeground,
     });
     this.jobs.set(job.id, job);
     this.persist(job);
@@ -149,6 +149,8 @@ export class JobRegistry {
         // their existing visibility and IDs rather than guessing from the prefix
         // (every command used to be bg-N).
         if (typeof job.background !== "boolean") job.background = true;
+        // Preserve IDs and provenance of legacy automatically backgrounded jobs.
+        if (typeof job.fromForeground !== "boolean") job.fromForeground = job.id.startsWith("fg-");
         if (job.status === "running") {
           if (job.hostPid !== process.pid) {
             job.status = "orphaned";

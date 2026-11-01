@@ -10,7 +10,7 @@ import type { Job } from "../src/types.ts";
 function job(over: Partial<Job> = {}): Job {
   return {
     id: "bg-1", command: "npm test", cwd: "/x", pid: 123, status: "done", exitCode: 0, signal: null,
-    logPath: "/no/log", startedAt: 1000, endedAt: 5200, background: true, auto: false, delivered: false, ...over,
+    logPath: "/no/log", startedAt: 1000, endedAt: 5200, background: true, fromForeground: false, delivered: false, ...over,
   };
 }
 

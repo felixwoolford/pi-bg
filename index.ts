@@ -8,17 +8,15 @@
  *     inherited file descriptors (no pipes, so no drain deadlock and no lost
  *     output at any volume), the process is spawned detached and unref'd so it
  *     survives the tool returning;
- *   - a foreground command that is still running after the auto-background
- *     threshold (default 30s, interactive sessions only) is moved to the
- *     background: the tool returns "moved to background, id=…" and the result is
- *     delivered into the conversation when the command finishes;
+ *   - foreground commands are awaited until completion, unless the user sends
+ *     /bg [prose] to transfer one to the background and steer the agent;
  *   - `background: true` launches detached from the start and returns the id
  *     immediately.
  *
  * `shell_status` polls or collects a job (and lists them all); `shell_kill`
  * terminates one and its whole process tree. Delivery only works in a session
- * that outlives the run, so auto-background is off under headless `pi -p` (explicit
- * background still works, collected with shell_status inside the turn).
+ * that outlives the run. Under headless `pi -p`, collect background results with
+ * shell_status inside the turn. Time-based backgrounding is disabled.
  *
  * pi has no native background bash — every command is awaited to completion —
  * so the spawn is our own, reusing pi's shell resolution (getShellConfig) for
@@ -43,7 +41,7 @@ import { spawnToFile, killTree } from "./src/spawn.ts";
 import { readTail } from "./src/tail.ts";
 import { buildEnv } from "./src/env.ts";
 import { DEFAULT_SETTINGS, resolveSettings, type ShellBgSettings } from "./src/config.ts";
-import { backgroundedResult, deliveryMessage, DELIVERY_TYPE, formatResult, formatList, header } from "./src/format.ts";
+import { backgroundedResult, deliveryMessage, DELIVERY_TYPE, STEERING_TYPE, formatResult, formatList, header } from "./src/format.ts";
 import { sanitizeOutput } from "./src/sanitize.ts";
 import { readFull } from "./src/tail.ts";
 import { STRUCTURED_OUTPUT_MAX_BYTES, bashOutputSchema, buildStructured, type BashStructured } from "./src/structured.ts";
@@ -68,6 +66,8 @@ export default function shellBackground(pi: ExtensionAPI) {
   let registry: JobRegistry | null = null;
   // Only running foreground executions need private shutdown bookkeeping.
   const foreground = new Set<Execution>();
+  // Only awaited, transferable calls are exposed to /bg; no public job IDs yet.
+  const backgroundRequests = new Map<Execution, (prose: string) => boolean>();
   let lastUiCtx: UiContext | null = null;
   let widgetTimer: NodeJS.Timeout | null = null;
   // Set on a /reload shutdown: this (old) instance's processes are being handed
@@ -84,13 +84,6 @@ export default function shellBackground(pi: ExtensionAPI) {
   // inside an in-flight tool call, so the timer must actually resolve rather than
   // let an otherwise-idle loop exit out from under it.
   const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
-  /**
-   * The one auto-background threshold, computed once so the bash guideline and
-   * runBash cannot drift: auto-background needs a session that outlives the run
-   * to deliver into, which a headless `pi -p` does not have, so it is off there.
-   */
-  const effectiveAutoMs = (hasUI: boolean): number => (hasUI ? settings.autoBackgroundMs : 0);
 
   // ── setup ──────────────────────────────────────────────────────────
 
@@ -228,8 +221,8 @@ export default function shellBackground(pi: ExtensionAPI) {
 
   /**
    * Jobs a shell_status wait is blocking on, by id. Seen on pi 1.0.4 with the
-   * TUI captured: a foreground command auto-backgrounds at 30s, the model
-   * waits on it with shell_status, the exit handler delivers the finish as a
+   * TUI captured: the model waits on a background job with shell_status,
+   * the exit handler delivers the finish as a
    * follow-up in the same instant the wait returns it, and the model spends a
    * whole extra turn acknowledging a result it had just reported. While a
    * wait is active the finish is returned there and marked collected; the
@@ -342,6 +335,7 @@ export default function shellBackground(pi: ExtensionAPI) {
 
     const settle = spawned.exit.then(({ code, signal: sig }) => {
       foreground.delete(execution);
+      backgroundRequests.delete(execution);
       if (execution.status === "running") {
         execution.status = execution.killedByUs || sig ? "killed" : code === 0 ? "done" : "failed";
       }
@@ -369,16 +363,18 @@ export default function shellBackground(pi: ExtensionAPI) {
     deadline?.unref();
     void settle.then(() => clearTimeout(deadline));
 
-    const background = (auto: boolean): ToolResult => {
-      job = owner.register(execution, auto);
+    const background = (fromForeground: boolean): ToolResult => {
+      job = owner.register(execution, fromForeground);
       foreground.delete(execution);
+      backgroundRequests.delete(execution);
       renderWidget(ctx);
       scheduleDelivery(job, settle);
       const r = backgroundedResult({
         id: job.id,
         command,
-        elapsedMs: auto ? Date.now() - execution.startedAt : 0,
-        auto,
+        elapsedMs: fromForeground ? Date.now() - execution.startedAt : 0,
+        fromForeground,
+        deliverResults: settings.deliverResults,
         interactive: ctx.hasUI,
         collectWith: "shell_status",
       });
@@ -393,26 +389,45 @@ export default function shellBackground(pi: ExtensionAPI) {
     if (signal?.aborted) onAbort();
     // Keep an awaited foreground call alive even though its child is unref'd.
     const tick = setInterval(() => onUpdate?.(snapshot(execution)), 1000);
-    let autoTimer: NodeJS.Timeout | undefined;
+    const moved = new Promise<ToolResult>((resolve) => {
+      backgroundRequests.set(execution, (prose) => {
+        if (!backgroundRequests.has(execution) || execution.status !== "running" ||
+            execution.killedByUs || timedOut || signal?.aborted || handedOff ||
+            runningBackground() >= settings.maxBackground) return false;
+        // Detach cancellation synchronously, before another steering/abort can
+        // affect the transferred process. Its original timeout remains active.
+        signal?.removeEventListener("abort", onAbort);
+        const result = background(true);
+        const message = [prose.trim(), result.content[0]!.text].filter(Boolean).join("\n\n");
+        try {
+          // Custom steering queues synchronously, before releasing the tool.
+          // This avoids a new model request racing ahead of the user's prose.
+          pi.sendMessage({
+            customType: STEERING_TYPE,
+            content: message,
+            display: true,
+            details: result.details,
+          }, { deliverAs: "steer", triggerTurn: true });
+          // The steering message carries the template; the tool result carries
+          // the current output, not a duplicate of that message.
+          resolve({ ...result, content: snapshot(execution).content });
+        } catch {
+          // Even if message injection fails, return the user's instructions and
+          // background handle through the already-awaited tool rather than hang.
+          resolve({ ...result, content: [{ type: "text", text: message }] });
+        }
+        return true;
+      });
+    });
     try {
-      const autoMs = effectiveAutoMs(ctx.hasUI);
-      const exit = settle.then(() => "exit");
-      const outcome = autoMs > 0 ? await Promise.race([exit, new Promise<string>((resolve) => {
-        autoTimer = setTimeout(() => resolve("auto"), autoMs);
-      })]) : await exit;
-      let keptForeground = false;
-      if (outcome === "auto" && execution.status === "running" && !timedOut && !signal?.aborted && !handedOff) {
-        if (runningBackground() < settings.maxBackground) return background(true);
-        keptForeground = true;
-      }
-      await settle;
+      const transferred = await Promise.race([moved, settle.then(() => undefined)]);
+      if (transferred) return transferred;
       const result = finished(execution);
       if (timedOut) result.content[0]!.text += `\n\n[killed: exceeded the ${params.timeout}s timeout]`;
       else if (signal?.aborted) result.content[0]!.text += "\n\n[killed: the turn was aborted]";
-      else if (keptForeground) result.content[0]!.text += `\n\n[kept in the foreground: ${settings.maxBackground} background commands were already running]`;
       return result;
     } finally {
-      clearTimeout(autoTimer);
+      backgroundRequests.delete(execution);
       clearInterval(tick);
       signal?.removeEventListener("abort", onAbort);
     }
@@ -422,14 +437,13 @@ export default function shellBackground(pi: ExtensionAPI) {
 
   function registerBash(cwd: string, hasUI: boolean): void {
     const original = createBashToolDefinition(cwd) as unknown as AnyTool;
-    const autoMs = effectiveAutoMs(hasUI);
-    // The guideline must match what runBash will actually do for this session:
-    // auto-background only happens interactively with a positive threshold.
-    const backgroundLine = !hasUI
-      ? `This is a headless run: commands run to completion unless you pass background:true, which returns an id immediately. Nothing is delivered after your turn, so collect a backgrounded command within the same turn with shell_status {id, wait: N} (it blocks until the command finishes or the wait elapses).`
-      : autoMs === 0
-        ? `Commands run to completion; pass background:true for anything long-running (a server, build, or watcher) to get an id back immediately, then collect or check it with shell_status.`
-        : `A command still running after ${Math.round(autoMs / 1000)}s is moved to the background and its result is delivered when it finishes; pass background:true to background a long task (a server, build, or watcher) immediately. Collect or check with shell_status.`;
+    const backgroundLine =
+      `Foreground commands wait for completion; there is no automatic backgrounding. ` +
+      `Prefer background:true for servers/watchers and tasks whose result is not needed before your next action. ` +
+      `Keep prerequisite builds, installs, migrations, and checks in the foreground, or explicitly wait for their background result with shell_status {id, wait: N}. ` +
+      (!hasUI
+        ? `This is a headless run: nothing is delivered after your turn, so collect background results within this same turn.`
+        : `The user can transfer a running foreground call with /bg, optionally adding steering instructions. A running job is not a successful result.`);
     const guidelines = [
       ...(Array.isArray((original as { promptGuidelines?: unknown }).promptGuidelines)
         ? ((original as { promptGuidelines?: string[] }).promptGuidelines as string[])
@@ -444,14 +458,16 @@ export default function shellBackground(pi: ExtensionAPI) {
       description:
         `Execute a shell command in the current working directory. Returns stdout and stderr, interleaved as they ` +
         `arrived; a long output is shown as its last ${Math.round(settings.tailBytes / 1024)}KB with the path of the ` +
-        `full log. Optionally provide a timeout in seconds, or background:true to get an id back immediately.`,
+        `full log. Foreground calls wait for completion; they never background automatically. ` +
+        `Prefer background:true for servers, watchers, and work independent of your next action; it returns a job id immediately. ` +
+        `Await prerequisite results before depending on them. Optionally provide a timeout in seconds.`,
       parameters: Type.Object({
         command: Type.String({ description: "Shell command to execute" }),
         timeout: Type.Optional(
           Type.Number({ description: "Timeout in seconds; a command that hits it is killed with its whole process tree." }),
         ),
         background: Type.Optional(
-          Type.Boolean({ description: "Launch detached and return an id immediately instead of waiting for the command to finish." }),
+          Type.Boolean({ description: "Return a job id immediately. Use for servers/watchers or work independent of your next action; collect with shell_status before relying on its result." }),
         ),
       }),
       promptGuidelines: guidelines,
@@ -541,6 +557,41 @@ export default function shellBackground(pi: ExtensionAPI) {
       job.killedByUs = true;
       killTree(job.pid);
       return { content: [{ type: "text", text: `Killing ${job.id} (pid ${job.pid ?? "?"}) and its process tree.` }], details: { id: job.id } };
+    },
+  });
+
+  pi.registerCommand("bg", {
+    description: "Background a running foreground shell command and steer the agent: /bg [message]",
+    handler: async (args, ctx) => {
+      const tasks = [...backgroundRequests.entries()].filter(([execution]) =>
+        execution.status === "running" && !execution.killedByUs);
+      if (tasks.length === 0) {
+        ctx.ui.notify("No foreground shell command to background; no steering message was sent.", "warning");
+        return;
+      }
+      let task = tasks[0]!;
+      if (tasks.length > 1) {
+        if (!ctx.hasUI) {
+          ctx.ui.notify("Several foreground shell commands are running; an interactive task picker is required.", "warning");
+          return;
+        }
+        const labels = tasks.map(([execution], i) =>
+          `${i + 1}. ${sanitizeOutput(execution.command).replace(/\s+/g, " ").trim().slice(0, 120)}`);
+        const selected = await ctx.ui.select("Background which foreground command?", labels);
+        if (selected === undefined) return;
+        const index = labels.indexOf(selected);
+        if (index < 0) return;
+        task = tasks[index]!;
+      }
+      // A picker yields: recheck capacity and liveness, never transfer a
+      // different task if the selected one finished while the dialog was open.
+      if (!registry || registry.running().length >= settings.maxBackground) {
+        ctx.ui.notify(`Background job limit reached (maxBackground = ${settings.maxBackground}); command left in the foreground. No steering message was sent.`, "warning");
+        return;
+      }
+      if (!task[1](args ?? "")) {
+        ctx.ui.notify("That foreground command finished or was cancelled; no steering message was sent.", "warning");
+      }
     },
   });
 
@@ -643,6 +694,7 @@ export default function shellBackground(pi: ExtensionAPI) {
       execution.endedAt = Date.now();
     }
     foreground.clear();
+    backgroundRequests.clear();
     if (event.reason === "reload") {
       // Same host process, a fresh instance is coming right after: hand the jobs
       // off rather than kill them. This (old) instance's closures go quiet

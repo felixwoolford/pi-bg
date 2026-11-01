@@ -19,7 +19,7 @@ function job(over: Partial<Job> = {}): Job {
     startedAt: 1000,
     endedAt: 5200,
     background: true,
-    auto: false,
+    fromForeground: false,
     delivered: false,
     ...over,
   };

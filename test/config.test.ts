@@ -2,26 +2,30 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { resolveSettings, DEFAULT_SETTINGS } from "../src/config.ts";
 
-test("defaults when there is no config", () => {
+test("defaults disable automatic backgrounding", () => {
   const { settings, warnings } = resolveSettings(undefined, {});
   assert.deepEqual(settings, DEFAULT_SETTINGS);
+  assert.equal(settings.autoBackgroundMs, 0);
   assert.deepEqual(warnings, []);
 });
 
 test("valid overrides are taken", () => {
-  const { settings } = resolveSettings({ autoBackgroundMs: 10_000, tailBytes: 8192 }, {});
-  assert.equal(settings.autoBackgroundMs, 10_000);
+  const { settings } = resolveSettings({ tailBytes: 8192, maxBackground: 3 }, {});
   assert.equal(settings.tailBytes, 8192);
+  assert.equal(settings.maxBackground, 3);
 });
 
-test("0 disables auto-background", () => {
-  const { settings } = resolveSettings({ autoBackgroundMs: 0 }, {});
-  assert.equal(settings.autoBackgroundMs, 0);
+test("legacy auto-background settings cannot enable automatic backgrounding", () => {
+  for (const value of [0, 100, 30_000, 999_999_999, "soon"]) {
+    const { settings, warnings } = resolveSettings({ autoBackgroundMs: value }, {});
+    assert.equal(settings.autoBackgroundMs, 0);
+    assert.ok(warnings.some((w) => w.includes("autoBackgroundMs") && w.includes("deprecated") && w.includes("ignored")));
+  }
 });
 
 test("out-of-range and wrong-type values fall back with a warning", () => {
-  const { settings, warnings } = resolveSettings({ autoBackgroundMs: 999_999_999, tailBytes: "big" }, {});
-  assert.equal(settings.autoBackgroundMs, 3_600_000, "clamped to max");
+  const { settings, warnings } = resolveSettings({ maxBackground: 999, tailBytes: "big" }, {});
+  assert.equal(settings.maxBackground, 64, "clamped to max");
   assert.equal(settings.tailBytes, DEFAULT_SETTINGS.tailBytes, "kept default");
   assert.ok(warnings.some((w) => w.includes("clamped")));
   assert.ok(warnings.some((w) => w.includes("must be a number")));
@@ -41,12 +45,12 @@ test("unknown keys warn and are ignored", () => {
   assert.ok(warnings.some((w) => w.includes('unknown setting "nope"')));
 });
 
-test("SHELL_BG_MS overrides the threshold", () => {
-  const { settings } = resolveSettings({ autoBackgroundMs: 30_000 }, { SHELL_BG_MS: "5000" });
-  assert.equal(settings.autoBackgroundMs, 5_000);
-  const bad = resolveSettings(undefined, { SHELL_BG_MS: "soon" });
-  assert.equal(bad.settings.autoBackgroundMs, DEFAULT_SETTINGS.autoBackgroundMs);
-  assert.ok(bad.warnings.some((w) => w.includes("not a number")));
+test("SHELL_BG_MS is deprecated and cannot enable automatic backgrounding", () => {
+  for (const value of ["5000", "0", "soon"]) {
+    const { settings, warnings } = resolveSettings(undefined, { SHELL_BG_MS: value });
+    assert.equal(settings.autoBackgroundMs, 0);
+    assert.ok(warnings.some((w) => w.includes("SHELL_BG_MS") && w.includes("deprecated") && w.includes("ignored")));
+  }
 });
 
 test("deliverResults defaults to true and accepts a boolean", () => {

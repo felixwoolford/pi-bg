@@ -6,7 +6,7 @@
 export type JobStatus = "running" | "done" | "failed" | "killed" | "orphaned";
 
 export interface Execution {
-  /** Assigned only when backgrounded: bg-N explicitly, fg-N automatically. */
+  /** Assigned only when backgrounded: bg-N at launch, fg-N transferred by the user. */
   id?: string;
   command: string;
   cwd: string;
@@ -29,10 +29,10 @@ export interface Execution {
   logPath: string;
   startedAt: number;
   endedAt: number | null;
-  /** Whether the command has actually entered the background (explicitly or automatically). */
+  /** Whether the command has actually entered the background. */
   background: boolean;
-  /** True if it reached the background because it outran the auto-threshold. */
-  auto: boolean;
+  /** True when transferred from a foreground call rather than backgrounded at launch. */
+  fromForeground: boolean;
   /** Whether the finished result has been delivered back to the conversation. */
   delivered: boolean;
   /** Set when we killed it (timeout/abort/shell_kill), so exit reads as killed. */

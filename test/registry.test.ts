@@ -9,7 +9,7 @@ function baseDir(): string {
   return mkdtempSync(join(tmpdir(), "sbg-reg-"));
 }
 
-test("only registration allocates an id, with separate explicit and automatic counters", () => {
+test("only registration allocates an id, with separate launch and transfer counters", () => {
   const dir = baseDir();
   try {
     const r = new JobRegistry(dir);
@@ -32,7 +32,7 @@ test("only registration allocates an id, with separate explicit and automatic co
     assert.equal(b.id, "fg-1");
     assert.equal(c.id, "bg-2");
     assert.equal(a.background, true);
-    assert.equal(b.auto, true);
+    assert.equal(b.fromForeground, true);
     assert.equal(r.running().length, 3);
     assert.equal(r.get("fg-1")?.command, "echo b");
   } finally {
@@ -58,7 +58,7 @@ test("persist writes a sidecar and load restores + continues the counter", () =>
     assert.equal(restored!.status, "done", "a running job with a dead pid settles");
     assert.equal(restored!.background, true);
     assert.equal(r2.register(r2.createExecution("echo next", "/x"), false).id, "bg-2");
-    assert.equal(r2.register(r2.createExecution("echo auto", "/x"), true).id, "fg-1", "the automatic counter is independent");
+    assert.equal(r2.register(r2.createExecution("echo moved", "/x"), true).id, "fg-1", "the transfer counter is independent");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -138,10 +138,28 @@ test("reload restores both counters without exposing old foreground records", ()
     restored.load();
     assert.equal(restored.all().length, 2);
     assert.equal(restored.get("bg-1")?.background, true);
-    assert.equal(restored.get("fg-1")?.auto, true);
+    assert.equal(restored.get("fg-1")?.fromForeground, true);
     assert.equal(restored.get("fg-8"), undefined);
     assert.equal(restored.register(restored.createExecution("echo next", "/x"), false).id, "bg-2");
     assert.equal(restored.register(restored.createExecution("echo next", "/x"), true).id, "fg-9");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("legacy automatically backgrounded jobs retain their IDs and foreground provenance", () => {
+  const dir = baseDir();
+  try {
+    const first = new JobRegistry(dir);
+    const legacy = {
+      ...first.createExecution("echo old", "/x"), id: "fg-3", status: "done", background: true,
+      fromForeground: undefined, auto: true,
+    };
+    writeFileSync(join(dir, "fg-3.json"), JSON.stringify(legacy));
+    const restored = new JobRegistry(dir);
+    restored.load();
+    assert.equal(restored.get("fg-3")?.fromForeground, true);
+    assert.equal(restored.register(restored.createExecution("echo new", "/x"), true).id, "fg-4");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import shellBackground from "../index.ts";
-import { DELIVERY_TYPE } from "../src/format.ts";
+import { DELIVERY_TYPE, STEERING_TYPE } from "../src/format.ts";
 
 // Isolate from the developer's own settings: the extension reads
 // <agentDir>/shell-background.json, which would otherwise leak into every test
@@ -24,20 +24,24 @@ interface Harness {
   pi: ExtensionAPI;
   tools: Map<string, AnyTool>;
   handlers: Map<string, AnyHandler>;
+  commands: Map<string, { handler: AnyHandler }>;
   sent: any[];
+  sendOptions: any[];
 }
 
 function harness(): Harness {
   const tools = new Map<string, AnyTool>();
   const handlers = new Map<string, AnyHandler>();
   const sent: any[] = [];
+  const sendOptions: any[] = [];
+  const commands = new Map<string, { handler: AnyHandler }>();
   const pi = {
     registerTool: (tool: AnyTool) => tools.set(tool.name, tool),
-    registerCommand: () => {},
+    registerCommand: (name: string, command: { handler: AnyHandler }) => commands.set(name, command),
     on: (event: string, handler: AnyHandler) => handlers.set(event, handler),
-    sendMessage: (msg: unknown) => sent.push(msg),
+    sendMessage: (msg: unknown, options: unknown) => { sent.push(msg); sendOptions.push(options); },
   };
-  return { pi: pi as unknown as ExtensionAPI, tools, handlers, sent };
+  return { pi: pi as unknown as ExtensionAPI, tools, handlers, commands, sent, sendOptions };
 }
 
 function makeCtx(cwd: string, hasUI: boolean, sessionId?: string): ExtensionContext {
@@ -54,6 +58,7 @@ function makeCtx(cwd: string, hasUI: boolean, sessionId?: string): ExtensionCont
     ui: {
       setWidget: () => {},
       notify: () => {},
+      select: async () => undefined,
       theme: { fg: (_c: string, t: string) => t, bold: (t: string) => t },
     },
   } as unknown as ExtensionContext;
@@ -143,7 +148,7 @@ test("jobs register only on backgrounding, with independent counters that surviv
   const ctxB = makeCtx(cwd, true, sid);
   try {
     mkdirSync(join(cwd, ".pi"), { recursive: true });
-    writeFileSync(join(cwd, ".pi", "shell-background.json"), JSON.stringify({ autoBackgroundMs: 400 }));
+    writeFileSync(join(cwd, ".pi", "shell-background.json"), JSON.stringify({ autoBackgroundMs: 400 })); // ignored legacy config
     shellBackground(a.pi);
     await a.handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctxA);
     const bash = a.tools.get("bash")!;
@@ -151,21 +156,28 @@ test("jobs register only on backgrounding, with independent counters that surviv
     assert.equal(quick.details.id, undefined);
     const explicit = await bash.execute("explicit", { command: "sleep 10", background: true }, undefined, undefined, ctxA);
     assert.equal(explicit.details.id, "bg-1");
-    assert.equal(explicit.details.auto, false);
+    assert.equal(explicit.details.fromForeground, false);
 
-    const moving = bash.execute("automatic", { command: "echo before; sleep 10" }, undefined, undefined, ctxA);
+    const moving = bash.execute("transfer", { command: "echo before; touch ready; sleep 10" }, undefined, undefined, ctxA);
+    await waitFor(() => existsSync(join(cwd, "ready")), 2000);
     const before = await a.tools.get("shell_status")!.execute("before", {});
     assert.match(before.content[0].text, /1 running, 1 total/);
     assert.deepEqual(readdirSync(regDir).filter((f) => f.endsWith(".json")), ["bg-1.json"]);
+    await a.commands.get("bg")!.handler("", ctxA);
     const moved = await moving;
     assert.equal(moved.details.id, "fg-1");
     assert.equal(moved.details.background, true);
     assert.equal(moved.structuredContent.job_id, "fg-1");
-    assert.equal(moved.details.auto, true);
+    assert.equal(moved.details.fromForeground, true);
+    assert.equal(moved.details.auto, undefined);
+    assert.equal(a.sent[0].customType, STEERING_TYPE);
+    assert.equal(a.sent[0].details.id, "fg-1");
+    assert.match(a.sent[0].content, /still running, not completed/);
+    assert.deepEqual(a.sendOptions[0], { deliverAs: "steer", triggerTurn: true });
     assert.match(moved.structuredContent.output, /before/, "output from before the transition survives");
     const sidecar = JSON.parse(readFileSync(join(regDir, "fg-1.json"), "utf8"));
     assert.equal(sidecar.background, true);
-    assert.equal(sidecar.auto, true);
+    assert.equal(sidecar.fromForeground, true);
 
     await a.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "reload" }, ctxA);
     shellBackground(b.pi);
@@ -176,8 +188,9 @@ test("jobs register only on backgrounding, with independent counters that surviv
     assert.match(list.content[0].text, /fg-1/);
     const next = await b.tools.get("bash")!.execute("next", { command: "sleep 10", background: true }, undefined, undefined, ctxB);
     assert.equal(next.details.id, "bg-2");
-    const nextAuto = await b.tools.get("bash")!.execute("next-auto", { command: "sleep 10" }, undefined, undefined, ctxB);
-    assert.equal(nextAuto.details.id, "fg-2");
+    const nextMoving = b.tools.get("bash")!.execute("next-transfer", { command: "sleep 10" }, undefined, undefined, ctxB);
+    await b.commands.get("bg")!.handler("", ctxB);
+    assert.equal((await nextMoving).details.id, "fg-2");
     const killed = await b.tools.get("shell_kill")!.execute("kill", { id: "fg-1" });
     assert.equal(killed.details.id, "fg-1");
     await waitFor(async () => (await b.tools.get("shell_status")!.execute("status", { id: "fg-1" })).details.status === "killed", 6000);
@@ -361,7 +374,7 @@ test("maxBackground: an explicit background request over the cap is refused, not
   }
 });
 
-test("maxBackground: over the cap a long foreground command stays in the foreground instead of auto-backgrounding", async () => {
+test("maxBackground: a user transfer over the cap leaves the foreground call awaited", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "sbg-cap2-"));
   const { id: sid, regDir } = uniqueSession();
   const prevMs = process.env.SHELL_BG_MS;
@@ -378,12 +391,17 @@ test("maxBackground: over the cap a long foreground command stays in the foregro
     const parked = await bash.execute("t1", { command: "sleep 3", background: true }, undefined, undefined, ctx);
     assert.ok(parked.details.id);
 
-    // Outlives the 200ms threshold, but the cap is full: it must NOT move to the
-    // background — it runs to completion in the foreground and says why.
-    const res = await bash.execute("t2", { command: "sleep 1" }, undefined, undefined, ctx);
+    let returned = false;
+    const running = bash.execute("t2", { command: "sleep 1" }, undefined, undefined, ctx).then((res) => { returned = true; return res; });
+    const notices: string[] = [];
+    ctx.ui.notify = (message) => { notices.push(message); };
+    await h.commands.get("bg")!.handler("do something else", ctx);
+    assert.equal(returned, false);
+    assert.equal(h.sent.length, 0, "a refused transfer must not send the prose or template");
+    assert.ok(notices.some((message) => message.includes("maxBackground = 1")));
+    const res = await running;
     assert.equal(res.details.background, false, "not backgrounded");
     assert.equal(res.details.status, "done");
-    assert.match(String(res.content[0].text), /kept in the foreground/);
     assert.equal(res.details.id, undefined);
   } finally {
     await teardown(h, ctx);
@@ -394,14 +412,14 @@ test("maxBackground: over the cap a long foreground command stays in the foregro
   }
 });
 
-test("a timeout still fires after a command auto-backgrounds (bug #3)", async () => {
+test("a user-transferred command detaches from abort but retains its original timeout", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "sbg-ext3-"));
   const { id: sid, regDir } = uniqueSession();
   const prevMs = process.env.SHELL_BG_MS;
-  // Move to the background quickly so the test does not wait the default 30s.
+  // A legacy override must not control the user-requested transition.
   process.env.SHELL_BG_MS = "200";
   const h = harness();
-  const ctx = makeCtx(cwd, true, sid); // hasUI so auto-background is enabled
+  const ctx = makeCtx(cwd, true, sid);
   try {
     shellBackground(h.pi);
     await h.handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctx);
@@ -409,16 +427,18 @@ test("a timeout still fires after a command auto-backgrounds (bug #3)", async ()
     const bash = h.tools.get("bash")!;
     const shellStatus = h.tools.get("shell_status")!;
 
-    // A command with a 1s timeout that outlives both the 200ms auto-background
-    // threshold and the timeout: it must auto-background, then the timeout must
-    // survive that move and kill it around the 1s mark (well before it would end
-    // on its own).
-    const res = await bash.execute("t1", { command: "sleep 3", timeout: 1 }, undefined, undefined, ctx);
+    const controller = new AbortController();
+    const running = bash.execute("t1", { command: "sleep 3", timeout: 1 }, controller.signal, undefined, ctx);
+    await h.commands.get("bg")!.handler("", ctx);
+    // Abort before even awaiting the returned tool result to catch a delayed
+    // listener detachment. /bg must not cancel the process.
+    controller.abort();
+    const res = await running;
     assert.equal(res.details.background, true, "the command was moved to the background");
     const jobId = res.details.id as string;
+    assert.equal((await shellStatus.execute("early", { id: jobId })).details.status, "running");
 
-    // Before the fix the timeout is dropped, so it is still "running" past the
-    // 1s deadline; after the fix the surviving timeout kills it.
+    // The original deadline must still fire after the transfer.
     await waitFor(async () => (await shellStatus.execute("p", { id: jobId })).details.status !== "running", 6000);
     const final = await shellStatus.execute("f", { id: jobId });
     assert.equal(final.details.status, "killed", "the surviving timeout killed the backgrounded job");
@@ -536,7 +556,7 @@ test("quit kills a running job and records it killed (finding f078 complement)",
 
 for (const { name, hasUI, threshold } of [
   { name: "headless", hasUI: false, threshold: "100" },
-  { name: "auto-background disabled", hasUI: true, threshold: "0" },
+  { name: "interactive with legacy auto-background configured", hasUI: true, threshold: "100" },
 ]) {
   test(`${name}: commands run to completion without auto-backgrounding`, async () => {
     const cwd = mkdtempSync(join(tmpdir(), "sbg-no-auto-"));
@@ -548,8 +568,10 @@ for (const { name, hasUI, threshold } of [
     try {
       shellBackground(h.pi);
       await h.handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctx);
-      // Outlive the headless case's configured threshold: checking guideline
-      // wording alone would not detect accidental auto-backgrounding here.
+      // Outlive a positive legacy threshold in either mode. Both config and
+      // environment overrides must be ignored, not just defaulted to zero.
+      mkdirSync(join(cwd, ".pi"));
+      writeFileSync(join(cwd, ".pi", "shell-background.json"), JSON.stringify({ autoBackgroundMs: 100 }));
       const result = await h.tools.get("bash")!.execute(
         "run", { command: "sleep 0.3; echo completed" }, undefined, undefined, ctx,
       );
@@ -659,6 +681,223 @@ test("issue #2: a job collected with shell_status during the turn is not also de
     assert.equal(h.sent.length, 0, "a job collected with shell_status is never delivered a second time");
   } finally {
     await teardown(h, ctx);
+    await rmDir(cwd);
+    await rmDir(regDir);
+  }
+});
+
+test("/bg preserves steering prose, releases the tool, and delivers the eventual result once", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "sbg-steer-"));
+  const { id: sid, regDir } = uniqueSession();
+  const h = harness();
+  const ctx = makeCtx(cwd, true, sid);
+  let running: Promise<any> | undefined;
+  try {
+    shellBackground(h.pi);
+    await h.handlers.get("session_start")!({ type: "session_start" }, ctx);
+    await h.handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+    let returned = false;
+    running = h.tools.get("bash")!.execute("foreground", {
+      command: "echo before; touch ready; while [ ! -e finish ]; do sleep 0.02; done; echo after",
+    }, undefined, undefined, ctx).then((result) => { returned = true; return result; });
+    await waitFor(() => existsSync(join(cwd, "ready")), 2000);
+    const prose = "Inspect the documentation meanwhile.\nDo not change files until the command finishes.";
+    await h.commands.get("bg")!.handler(prose, ctx);
+    await waitFor(() => returned, 1000);
+    const result = await running;
+    assert.equal(result.details.id, "fg-1");
+    assert.equal(result.structuredContent.status, "running");
+    assert.equal(result.structuredContent.exit_code, undefined);
+    assert.match(result.structuredContent.output, /before/);
+    assert.equal(h.sent.length, 1, "steering was queued before the call returned");
+    assert.equal(h.sent[0].customType, STEERING_TYPE);
+    assert.ok(h.sent[0].content.startsWith(prose + "\n\n"), "prose and newlines are preserved");
+    assert.match(h.sent[0].content, /fg-1/);
+    assert.match(h.sent[0].content, /not completed or verified/);
+    assert.deepEqual(h.sendOptions[0], { deliverAs: "steer", triggerTurn: true });
+
+    writeFileSync(join(cwd, "finish"), "");
+    await waitFor(() => JSON.parse(readFileSync(join(regDir, "fg-1.json"), "utf8")).status === "done", 3000);
+    assert.equal(h.sent.length, 1, "completion waits until settlement");
+    await h.handlers.get("agent_settled")!({ type: "agent_settled" }, ctx);
+    assert.equal(h.sent.length, 2);
+    assert.equal(h.sent[1].customType, DELIVERY_TYPE);
+    assert.match(h.sent[1].content, /before\nafter/);
+    await h.handlers.get("agent_settled")!({ type: "agent_settled" }, ctx);
+    assert.equal(h.sent.length, 2, "no duplicate completion");
+  } finally {
+    await teardown(h, ctx);
+    await running;
+    await rmDir(cwd);
+    await rmDir(regDir);
+  }
+});
+
+test("/bg steering still works when automatic completion delivery is disabled", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "sbg-steer-no-delivery-"));
+  const { id: sid, regDir } = uniqueSession();
+  const h = harness();
+  const ctx = makeCtx(cwd, true, sid);
+  let running: Promise<any> | undefined;
+  try {
+    mkdirSync(join(cwd, ".pi"));
+    writeFileSync(join(cwd, ".pi", "shell-background.json"), JSON.stringify({ deliverResults: false }));
+    shellBackground(h.pi);
+    await h.handlers.get("session_start")!({ type: "session_start" }, ctx);
+    await h.handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+    running = h.tools.get("bash")!.execute("foreground", {
+      command: "while [ ! -e finish ]; do sleep 0.02; done; echo completed",
+    }, undefined, undefined, ctx);
+    await h.commands.get("bg")!.handler("", ctx);
+    const result = await running;
+    assert.equal(result.details.pollRequired, true);
+    assert.equal(h.sent.length, 1);
+    assert.equal(h.sent[0].customType, STEERING_TYPE);
+    assert.match(h.sent[0].content, /Automatic result delivery is disabled/);
+    writeFileSync(join(cwd, "finish"), "");
+    const collected = await h.tools.get("shell_status")!.execute("collect", { id: "fg-1", wait: 2 });
+    assert.equal(collected.details.status, "done");
+    assert.match(collected.structuredContent.output, /completed/);
+    await h.handlers.get("agent_settled")!({ type: "agent_settled" }, ctx);
+    assert.equal(h.sent.length, 1, "only the requested steering, never a completion push");
+  } finally {
+    await teardown(h, ctx);
+    await running;
+    await rmDir(cwd);
+    await rmDir(regDir);
+  }
+});
+
+test("/bg returns the handle and prose through the tool if steering injection throws", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "sbg-steer-fallback-"));
+  const { id: sid, regDir } = uniqueSession();
+  const h = harness();
+  const ctx = makeCtx(cwd, true, sid);
+  let running: Promise<any> | undefined;
+  try {
+    shellBackground(h.pi);
+    await h.handlers.get("session_start")!({ type: "session_start" }, ctx);
+    h.pi.sendMessage = () => { throw new Error("message injection unavailable"); };
+    running = h.tools.get("bash")!.execute("foreground", { command: "sleep 10" }, undefined, undefined, ctx);
+    await h.commands.get("bg")!.handler("Keep this instruction.", ctx);
+    const result = await running;
+    assert.equal(result.details.id, "fg-1");
+    assert.equal(result.structuredContent.status, "running");
+    assert.match(result.content[0].text, /Keep this instruction/);
+    assert.match(result.content[0].text, /fg-1/);
+  } finally {
+    await teardown(h, ctx);
+    await running;
+    await rmDir(cwd);
+    await rmDir(regDir);
+  }
+});
+
+test("/bg picks only the selected task, supports cancellation, and does nothing without a foreground call", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "sbg-pick-"));
+  const { id: sid, regDir } = uniqueSession();
+  const h = harness();
+  const ctx = makeCtx(cwd, true, sid);
+  const calls: Promise<any>[] = [];
+  try {
+    shellBackground(h.pi);
+    await h.handlers.get("session_start")!({ type: "session_start" }, ctx);
+    let firstReturned = false;
+    calls.push(h.tools.get("bash")!.execute("first", { command: "sleep 10; echo first" }, undefined, undefined, ctx)
+      .then((result) => { firstReturned = true; return result; }));
+    calls.push(h.tools.get("bash")!.execute("second", { command: "sleep 10; echo second" }, undefined, undefined, ctx));
+    ctx.ui.select = async (_title, options) => {
+      assert.equal(options.length, 2);
+      return undefined;
+    };
+    await h.commands.get("bg")!.handler("cancelled prose", ctx);
+    assert.equal(h.sent.length, 0);
+    assert.equal(firstReturned, false);
+    assert.deepEqual(readdirSync(regDir).filter((f) => f.endsWith(".json")), []);
+
+    ctx.ui.select = async (_title, options) => options[1];
+    await h.commands.get("bg")!.handler("Review the first task while the second runs.", ctx);
+    assert.equal((await calls[1]).details.id, "fg-1");
+    assert.equal(firstReturned, false, "the unselected call is still awaited");
+    assert.equal(h.sent.length, 1);
+    assert.equal(h.sent[0].details.id, "fg-1");
+    assert.match(JSON.parse(readFileSync(join(regDir, "fg-1.json"), "utf8")).command, /second/);
+
+    // Only one call remains: there must be no second picker.
+    ctx.ui.select = async () => { throw new Error("unexpected picker"); };
+    await h.commands.get("bg")!.handler("", ctx);
+    assert.equal((await calls[0]).details.id, "fg-2");
+    assert.equal(h.sent.length, 2);
+    await h.commands.get("bg")!.handler("must not be sent", ctx);
+    assert.equal(h.sent.length, 2, "no active call: no steering or duplicate registration");
+  } finally {
+    await teardown(h, ctx);
+    await Promise.all(calls);
+    await rmDir(cwd);
+    await rmDir(regDir);
+  }
+});
+
+test("/bg never substitutes a different task if the selection finishes while the picker is open", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "sbg-pick-exit-"));
+  const { id: sid, regDir } = uniqueSession();
+  const h = harness();
+  const ctx = makeCtx(cwd, true, sid);
+  const calls: Promise<any>[] = [];
+  try {
+    shellBackground(h.pi);
+    await h.handlers.get("session_start")!({ type: "session_start" }, ctx);
+    calls.push(h.tools.get("bash")!.execute("first", {
+      command: "while [ ! -e finish ]; do sleep 0.02; done",
+    }, undefined, undefined, ctx));
+    let secondReturned = false;
+    calls.push(h.tools.get("bash")!.execute("second", { command: "sleep 10" }, undefined, undefined, ctx)
+      .then((result) => { secondReturned = true; return result; }));
+    const notices: string[] = [];
+    ctx.ui.notify = (message) => { notices.push(message); };
+    ctx.ui.select = async (_title, options) => {
+      writeFileSync(join(cwd, "finish"), "");
+      assert.equal((await calls[0]).details.status, "done");
+      return options[0];
+    };
+    await h.commands.get("bg")!.handler("must not be sent", ctx);
+    assert.equal(secondReturned, false);
+    assert.equal(h.sent.length, 0);
+    assert.deepEqual(readdirSync(regDir).filter((f) => f.endsWith(".json")), []);
+    assert.ok(notices.some((message) => message.includes("finished or was cancelled")));
+  } finally {
+    await teardown(h, ctx);
+    await Promise.all(calls);
+    await rmDir(cwd);
+    await rmDir(regDir);
+  }
+});
+
+test("/bg rechecks the background limit after the picker yields", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "sbg-pick-cap-"));
+  const { id: sid, regDir } = uniqueSession();
+  const h = harness();
+  const ctx = makeCtx(cwd, true, sid);
+  const calls: Promise<any>[] = [];
+  try {
+    mkdirSync(join(cwd, ".pi"));
+    writeFileSync(join(cwd, ".pi", "shell-background.json"), JSON.stringify({ maxBackground: 1 }));
+    shellBackground(h.pi);
+    await h.handlers.get("session_start")!({ type: "session_start" }, ctx);
+    const bash = h.tools.get("bash")!;
+    calls.push(bash.execute("first", { command: "sleep 10" }, undefined, undefined, ctx));
+    calls.push(bash.execute("second", { command: "sleep 10" }, undefined, undefined, ctx));
+    ctx.ui.select = async (_title, options) => {
+      const parked = await bash.execute("fill-cap", { command: "sleep 10", background: true }, undefined, undefined, ctx);
+      assert.equal(parked.details.id, "bg-1");
+      return options[0];
+    };
+    await h.commands.get("bg")!.handler("must not be sent", ctx);
+    assert.equal(h.sent.length, 0);
+    assert.deepEqual(readdirSync(regDir).filter((f) => f.endsWith(".json")), ["bg-1.json"]);
+  } finally {
+    await teardown(h, ctx);
+    await Promise.all(calls);
     await rmDir(cwd);
     await rmDir(regDir);
   }

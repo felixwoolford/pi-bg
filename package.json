@@ -1,7 +1,7 @@
 {
   "name": "shell-background",
   "version": "0.1.1",
-  "description": "Long-running bash goes async: background: true launches detached, and any command still running after 30s auto-backgrounds and delivers its result when it finishes",
+  "description": "Explicit background shell jobs for Pi, with user-triggered foreground transfer, status tools, and completion delivery",
   "keywords": [
     "pi-package",
     "pi-extension",

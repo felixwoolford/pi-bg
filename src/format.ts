@@ -58,8 +58,10 @@ export interface BackgroundedInput {
   id: string;
   command: string;
   elapsedMs: number;
-  /** True on the auto-30s path, false when the caller asked for background. */
-  auto: boolean;
+  /** True when the user transfers a running foreground call with /bg. */
+  fromForeground: boolean;
+  /** Whether uncollected results will be delivered automatically. */
+  deliverResults: boolean;
   /** Whether a UI/interactive session is present to deliver into. */
   interactive: boolean;
   /** The tool to collect with, e.g. "shell_status". */
@@ -84,7 +86,7 @@ export interface BackgroundedResult {
     id: string;
     status: "running";
     background: true;
-    auto: boolean;
+    fromForeground: boolean;
     retryable: true;
     pollRequired: boolean;
     elapsedMs: number;
@@ -93,30 +95,35 @@ export interface BackgroundedResult {
 
 /** Launch guidance differs because headless sessions cannot deliver after the run ends. */
 export function backgroundedResult(input: BackgroundedInput): BackgroundedResult {
-  const head = input.auto
-    ? `${input.id} is still running after ${elapsed(input.elapsedMs)} — moved to the background.`
+  const head = input.fromForeground
+    ? `The user moved ${input.id} to the background after ${elapsed(input.elapsedMs)} without cancelling it.`
     : `${input.id} started in the background.`;
   const line = `  $ ${clip(input.command)}`;
-  const tail = input.interactive
+  const tail = !input.interactive
     ? [
-        "Its result is delivered here automatically when it finishes, so carry on with other",
-        `work. ${input.collectWith} with id "${input.id}" is only if you want it early, and ${input.collectWith}`,
-        "with no id lists everything still running.",
-      ]
-    : [
         "This is a headless run: nothing is delivered after your turn ends. Collect it",
         `in this same turn — ${input.collectWith} {id: "${input.id}", wait: 60} blocks until it`,
         "finishes (or the wait elapses); do not end your turn expecting the result to arrive on its own.",
-      ];
+      ]
+    : input.deliverResults
+      ? [
+          "Its uncollected result will be delivered when it finishes and the agent settles.",
+          `Use ${input.collectWith} {id: "${input.id}", wait: 60} if you need the result first.`,
+        ]
+      : [
+          "Automatic result delivery is disabled.",
+          `Collect the result with ${input.collectWith} {id: "${input.id}", wait: 60}.`,
+        ];
+  tail.unshift("The command is still running, not completed or verified. Only proceed with work independent of its result.");
   return {
     text: [head, line, "", ...tail].join("\n"),
     details: {
       id: input.id,
       status: "running",
       background: true,
-      auto: input.auto,
+      fromForeground: input.fromForeground,
       retryable: true,
-      pollRequired: !input.interactive,
+      pollRequired: !input.interactive || !input.deliverResults,
       elapsedMs: input.elapsedMs,
     },
   };
@@ -136,3 +143,6 @@ export function deliveryMessage(id: string, body: string): string {
 
 /** The custom-message type a delivered result travels under. */
 export const DELIVERY_TYPE = "shell-background-result";
+
+/** The user-triggered background-and-steer message, distinct from a finished result. */
+export const STEERING_TYPE = "shell-background-steering";

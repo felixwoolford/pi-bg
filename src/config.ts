@@ -1,50 +1,30 @@
 /**
- * Settings for shell-background.
- *
- * The one number that is genuinely a matter of taste is the auto-background
- * threshold: how long a foreground command may run before it is moved to the
- * background so the agent gets its turn back. Read from `.pi/shell-background.json`
- * (project) or `<agentDir>/shell-background.json` (global), with a SHELL_BG_MS
- * env override for one-off runs and CI. Bad values fall back to the default with
- * a warning rather than taking the extension down.
+ * Settings from `.pi/shell-background.json` (project) or
+ * `<agentDir>/shell-background.json` (global). Invalid values warn and fall back
+ * to defaults rather than taking the extension down.
  */
 
 export interface ShellBgSettings {
-  /** Foreground ms before a command auto-backgrounds. 0 disables auto-background. */
+  /** @deprecated Ignored. Automatic backgrounding is disabled; remove in a future release. */
   autoBackgroundMs: number;
   /** Bytes of the log tail shown in a status/collect result. */
   tailBytes: number;
-  /**
-   * How many background jobs may be alive at once before a request to background one
-   * more is refused and an auto-background transition is skipped. Every live
-   * job is a whole process tree plus an open log; a session that keeps
-   * starting servers and watchers should hear about it rather than
-   * accumulate them without bound. Only the backgrounding decision is capped
-   * — a command itself is never refused.
-   */
+  /** Maximum live background jobs. Foreground execution does not count. */
   maxBackground: number;
-  /**
-   * Whether a finished background job pushes its result into the conversation
-   * (and triggers a new agent turn that explains it). false: the job still
-   * finishes, the widget updates, and shell_status collects the result, but
-   * nothing is injected and the agent is not woken.
-   */
+  /** Deliver uncollected background results once the agent settles. */
   deliverResults: boolean;
 }
 
 export const DEFAULT_SETTINGS: ShellBgSettings = {
-  autoBackgroundMs: 30_000,
+  autoBackgroundMs: 0,
   tailBytes: 64 * 1024,
   maxBackground: 8,
   deliverResults: true,
 };
 
-type NumericKey = Exclude<keyof ShellBgSettings, "deliverResults">;
+type NumericKey = "tailBytes" | "maxBackground";
 
 const LIMITS: Record<NumericKey, { min: number; max: number }> = {
-  // 0 is allowed (disable); otherwise at least 1s so a typo of "30" (=30ms)
-  // does not make every command look long-running.
-  autoBackgroundMs: { min: 0, max: 3_600_000 },
   tailBytes: { min: 1024, max: 4 * 1024 * 1024 },
   maxBackground: { min: 1, max: 64 },
 };
@@ -61,7 +41,13 @@ export function resolveSettings(
       warnings.push("settings file is not an object — ignored");
     } else {
       for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
-        if (!(key in DEFAULT_SETTINGS)) {
+        // TODO: Remove these compatibility settings in a future release. They
+        // must never re-enable time-based backgrounding, even in old configs.
+        if (key === "autoBackgroundMs") {
+          warnings.push('"autoBackgroundMs" is deprecated and ignored; automatic backgrounding is disabled and scheduled for removal');
+          continue;
+        }
+        if (!Object.hasOwn(DEFAULT_SETTINGS, key)) {
           warnings.push(`unknown setting "${key}"`);
           continue;
         }
@@ -80,11 +66,8 @@ export function resolveSettings(
     }
   }
 
-  const envMs = env.SHELL_BG_MS;
-  if (envMs !== undefined && envMs !== "") {
-    const n = Number(envMs);
-    if (Number.isFinite(n)) settings.autoBackgroundMs = clamp("autoBackgroundMs", n, warnings);
-    else warnings.push(`SHELL_BG_MS="${envMs}" is not a number — ignored`);
+  if (env.SHELL_BG_MS !== undefined && env.SHELL_BG_MS !== "") {
+    warnings.push("SHELL_BG_MS is deprecated and ignored; automatic backgrounding is disabled and scheduled for removal");
   }
 
   return { settings, warnings };
