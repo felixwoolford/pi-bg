@@ -55,7 +55,9 @@ The widget above the editor shows running background jobs and jobs completed in 
 
 ## Completion delivery
 
-An uncollected background result is pushed into the conversation once, after the current agent run settles, or immediately if the agent is idle. Collecting a finished job with `shell_status` suppresses duplicate delivery. Polling a still-running job does not cancel its eventual delivery.
+An uncollected background result is pushed into the conversation once, at the next safe turn boundary before the next model request, or immediately if Pi's `ctx.isIdle()` reports that the agent is idle. Activity comes from Pi directly, not extension-maintained lifecycle flags. Collecting a finished job with `shell_status` suppresses duplicate delivery. Polling a still-running job does not cancel its eventual delivery.
+
+In interactive sessions with automatic delivery enabled, no status check is required. Use `shell_status` for progress or to explicitly wait for a result.
 
 Under headless `pi -p`, collect results within the same run using `shell_status { id, wait: N }`: the session does not remain alive after the prompt completes. `wait` is clamped to 0–300 seconds.
 

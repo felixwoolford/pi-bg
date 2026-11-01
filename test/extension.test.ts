@@ -48,6 +48,7 @@ function makeCtx(cwd: string, hasUI: boolean, sessionId?: string): ExtensionCont
   return {
     cwd,
     hasUI,
+    isIdle: () => true,
     // The registry keys off the session id (stable across /reload); the unit
     // tests supply one so a session survives a simulated reload the way it does
     // in a real host, where PI_SESSION_ID is never on the host's own env.
@@ -662,8 +663,8 @@ test("issue #2: a job collected with shell_status during the turn is not also de
   try {
     shellBackground(h.pi);
     await h.handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctx);
-    // A turn is running: delivery must be deferred to its end, not sent at exit.
-    await h.handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+    // Pi is busy: hold delivery until a safe boundary, without lifecycle events.
+    ctx.isIdle = () => false;
     const bash = h.tools.get("bash")!;
     const shellStatus = h.tools.get("shell_status")!;
 
@@ -675,8 +676,8 @@ test("issue #2: a job collected with shell_status during the turn is not also de
     await sleep(300); // let any exit-time delivery attempt settle
     assert.equal(h.sent.length, 0, "collected during the turn, so nothing queued");
 
-    // The turn ends: the drain must skip the already-collected job.
-    await h.handlers.get("agent_settled")!({ type: "agent_settled", aborted: false }, ctx);
+    // The tool batch ends while Pi is still busy: skip the collected job.
+    await h.handlers.get("turn_end")!({ type: "turn_end" }, ctx);
     await sleep(200);
     assert.equal(h.sent.length, 0, "a job collected with shell_status is never delivered a second time");
   } finally {
@@ -695,7 +696,7 @@ test("/bg preserves steering prose, releases the tool, and delivers the eventual
   try {
     shellBackground(h.pi);
     await h.handlers.get("session_start")!({ type: "session_start" }, ctx);
-    await h.handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+    ctx.isIdle = () => false;
     let returned = false;
     running = h.tools.get("bash")!.execute("foreground", {
       command: "echo before; touch ready; while [ ! -e finish ]; do sleep 0.02; done; echo after",
@@ -718,12 +719,12 @@ test("/bg preserves steering prose, releases the tool, and delivers the eventual
 
     writeFileSync(join(cwd, "finish"), "");
     await waitFor(() => JSON.parse(readFileSync(join(regDir, "fg-1.json"), "utf8")).status === "done", 3000);
-    assert.equal(h.sent.length, 1, "completion waits until settlement");
-    await h.handlers.get("agent_settled")!({ type: "agent_settled" }, ctx);
+    assert.equal(h.sent.length, 1, "completion waits until the tool batch ends");
+    await h.handlers.get("turn_end")!({ type: "turn_end" }, ctx);
     assert.equal(h.sent.length, 2);
     assert.equal(h.sent[1].customType, DELIVERY_TYPE);
     assert.match(h.sent[1].content, /before\nafter/);
-    await h.handlers.get("agent_settled")!({ type: "agent_settled" }, ctx);
+    await h.handlers.get("turn_end")!({ type: "turn_end" }, ctx);
     assert.equal(h.sent.length, 2, "no duplicate completion");
   } finally {
     await teardown(h, ctx);
@@ -744,7 +745,7 @@ test("/bg steering still works when automatic completion delivery is disabled", 
     writeFileSync(join(cwd, ".pi", "shell-background.json"), JSON.stringify({ deliverResults: false }));
     shellBackground(h.pi);
     await h.handlers.get("session_start")!({ type: "session_start" }, ctx);
-    await h.handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+    ctx.isIdle = () => false;
     running = h.tools.get("bash")!.execute("foreground", {
       command: "while [ ! -e finish ]; do sleep 0.02; done; echo completed",
     }, undefined, undefined, ctx);
@@ -758,7 +759,7 @@ test("/bg steering still works when automatic completion delivery is disabled", 
     const collected = await h.tools.get("shell_status")!.execute("collect", { id: "fg-1", wait: 2 });
     assert.equal(collected.details.status, "done");
     assert.match(collected.structuredContent.output, /completed/);
-    await h.handlers.get("agent_settled")!({ type: "agent_settled" }, ctx);
+    await h.handlers.get("turn_end")!({ type: "turn_end" }, ctx);
     assert.equal(h.sent.length, 1, "only the requested steering, never a completion push");
   } finally {
     await teardown(h, ctx);
@@ -903,27 +904,45 @@ test("/bg rechecks the background limit after the picker yields", async () => {
   }
 });
 
-test("issue #2: a job nobody collects is delivered once at the turn boundary, not mid-turn", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "sbg-issue2b-"));
+test("busy completions arrive at the next tool boundary; native idle completions need no boundary", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "sbg-boundary-"));
   const { id: sid, regDir } = uniqueSession();
   const h = harness();
-  const ctx = makeCtx(cwd, false, sid);
+  const ctx = makeCtx(cwd, true, sid);
+  let idle = false;
+  ctx.isIdle = () => idle;
   try {
     shellBackground(h.pi);
-    await h.handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctx);
-    await h.handlers.get("agent_start")!({ type: "agent_start" }, ctx);
-    const started = await h.tools.get("bash")!.execute("t1", { command: "echo done", background: true }, undefined, undefined, ctx);
-    const jobId = started.details.id as string;
+    await h.handlers.get("session_start")!({ type: "session_start" }, ctx);
+    const bash = h.tools.get("bash")!;
+    const started = await bash.execute("background", {
+      command: "sleep 0.05; echo background-complete; touch background-done", background: true,
+    }, undefined, undefined, ctx);
+    assert.match(started.content[0].text, /Completion will be delivered automatically; no status check is required/);
+    const foreground = await bash.execute("foreground", {
+      command: "while [ ! -e background-done ]; do sleep 0.02; done; sleep 0.05; echo foreground-complete",
+    }, undefined, undefined, ctx);
+    assert.equal(foreground.details.status, "done");
+    await waitFor(() => JSON.parse(readFileSync(join(regDir, `${started.details.id}.json`), "utf8")).status === "done", 3000);
+    assert.equal(h.sent.length, 0, "do not insert a completion in the middle of a tool batch");
 
-    // The job finishes during the turn but is not collected: held, not sent yet.
-    await sleep(800);
-    assert.equal(h.sent.length, 0, "not delivered while the turn is still running");
-
-    // The turn ends: now it is delivered, exactly once.
-    await h.handlers.get("agent_settled")!({ type: "agent_settled", aborted: false }, ctx);
-    assert.equal(h.sent.length, 1, "delivered once when the turn ended");
+    // The agent is still busy. Deliver before its next request, not after its
+    // final response, so it can report both outcomes without a status call.
+    await h.handlers.get("turn_end")!({ type: "turn_end" }, ctx);
+    assert.equal(ctx.isIdle(), false);
+    assert.equal(h.sent.length, 1);
     assert.equal(h.sent[0].customType, DELIVERY_TYPE);
-    assert.equal(h.sent[0].details.id, jobId);
+    assert.equal(h.sent[0].details.id, started.details.id);
+    assert.match(h.sent[0].content, /background-complete/);
+    await h.handlers.get("turn_end")!({ type: "turn_end" }, ctx);
+    assert.equal(h.sent.length, 1, "completion is delivered exactly once");
+
+    // A native-state change needs no matching extension lifecycle event.
+    idle = true;
+    const next = await bash.execute("idle-background", { command: "echo idle-complete", background: true }, undefined, undefined, ctx);
+    await waitFor(() => h.sent.length === 2, 3000);
+    assert.equal(h.sent[1].details.id, next.details.id);
+    assert.match(h.sent[1].content, /idle-complete/);
   } finally {
     await teardown(h, ctx);
     await rmDir(cwd);

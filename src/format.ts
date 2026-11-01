@@ -107,8 +107,8 @@ export function backgroundedResult(input: BackgroundedInput): BackgroundedResult
       ]
     : input.deliverResults
       ? [
-          "Its uncollected result will be delivered when it finishes and the agent settles.",
-          `Use ${input.collectWith} {id: "${input.id}", wait: 60} if you need the result first.`,
+          "Completion will be delivered automatically; no status check is required.",
+          `Use ${input.collectWith} only for progress or to explicitly wait for a result.`,
         ]
       : [
           "Automatic result delivery is disabled.",

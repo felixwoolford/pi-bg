@@ -231,29 +231,15 @@ export default function shellBackground(pi: ExtensionAPI) {
   const waiters = new Map<string, number>();
   const awaited = (job: Job): boolean => (waiters.get(job.id) ?? 0) > 0;
 
-  // A finished job's result must reach the model exactly once, and NOT while
-  // the model may still collect it itself. The old code sent the follow-up the
-  // instant the process exited, so a `shell_status {id}` that collected the
-  // same job later in that turn got the result a second time (issue #2): the
-  // message was already queued when the job ended, and marking it collected
-  // afterwards was too late. So a finished job is held in `pending` and
-  // delivered only at a turn boundary (agent_settled) — or right away while
-  // idle, so a job finishing between turns still wakes the agent — and the
-  // drain skips any job a `shell_status` read marked `delivered` meanwhile.
-  // `waiters` still covers an ACTIVE wait, which returns and collects the
-  // result itself and so must never also be sent.
+  // While Pi is busy, hold completions until the tool batch ends. A status
+  // call in that batch can collect a result first, suppressing duplicate
+  // delivery. Idle completions wake the agent immediately.
   const pending = new Set<Job>();
-  let turnActive = false;
 
   function enqueueDelivery(job: Job): void {
-    if (job.delivered) return;
+    if (handedOff || job.delivered) return;
     pending.add(job);
-    maybeDrainDeliveries();
-  }
-
-  /** Drain now only while idle; during a turn the model may still collect a job, so wait for agent_settled. */
-  function maybeDrainDeliveries(): void {
-    if (!turnActive) drainDeliveries();
+    if (lastUiCtx?.isIdle()) drainDeliveries();
   }
 
   function drainDeliveries(): void {
@@ -440,7 +426,7 @@ export default function shellBackground(pi: ExtensionAPI) {
     const backgroundLine =
       `Foreground commands wait for completion; there is no automatic backgrounding. ` +
       `Prefer background:true for servers/watchers and tasks whose result is not needed before your next action. ` +
-      `Keep prerequisite builds, installs, migrations, and checks in the foreground, or explicitly wait for their background result with shell_status {id, wait: N}. ` +
+      `Await prerequisite results before depending on them, whether returned directly, delivered automatically, or collected with shell_status {id, wait: N}. ` +
       (!hasUI
         ? `This is a headless run: nothing is delivered after your turn, so collect background results within this same turn.`
         : `The user can transfer a running foreground call with /bg, optionally adding steering instructions. A running job is not a successful result.`);
@@ -467,7 +453,7 @@ export default function shellBackground(pi: ExtensionAPI) {
           Type.Number({ description: "Timeout in seconds; a command that hits it is killed with its whole process tree." }),
         ),
         background: Type.Optional(
-          Type.Boolean({ description: "Return a job id immediately. Use for servers/watchers or work independent of your next action; collect with shell_status before relying on its result." }),
+          Type.Boolean({ description: "Return a job id immediately. Use for servers/watchers or work independent of your next action. Await completion, delivered automatically or collected with shell_status, before relying on its result." }),
         ),
       }),
       promptGuidelines: guidelines,
@@ -630,7 +616,7 @@ export default function shellBackground(pi: ExtensionAPI) {
     if (adopted.length === 0) return;
     lastUiCtx = ctx;
     const timer = setInterval(() => {
-      if (!registry) {
+      if (handedOff || !registry) {
         clearInterval(timer);
         return;
       }
@@ -659,20 +645,15 @@ export default function shellBackground(pi: ExtensionAPI) {
     timer.unref?.();
   }
 
-  // Turn boundaries drive delivery: a finished job is pushed only when the
-  // current turn ends, so a job the model collects during the turn is never
-  // also delivered as a follow-up (issue #2).
-  pi.on("agent_start", async (_event, ctx) => {
-    turnActive = true;
-    lastUiCtx = ctx;
-  });
-  pi.on("agent_settled", async (_event, ctx) => {
-    turnActive = false;
+  // All tool results are recorded here, before the next model request. Flush
+  // even while ctx.isIdle() is false: this is a safe boundary within the run.
+  pi.on("turn_end", async (_event, ctx) => {
     lastUiCtx = ctx;
     drainDeliveries();
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    lastUiCtx = ctx;
     const warnings = loadSettings(ctx.cwd);
     const key = sessionKey(ctx);
     sweepOldDirs(key);
