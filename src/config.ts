@@ -3,6 +3,8 @@
  * `<agentDir>/shell-background.json` (global). Invalid values warn and fall back
  * to defaults rather than taking the extension down.
  */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 export interface ShellBgSettings {
   /** @deprecated Ignored. Automatic backgrounding is disabled; remove in a future release. */
@@ -71,6 +73,31 @@ export function resolveSettings(
   }
 
   return { settings, warnings };
+}
+
+/** First readable file wins: project settings replace, rather than merge with, global settings. */
+export function loadSettings(
+  cwd: string,
+  agentDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { settings: ShellBgSettings; warnings: string[] } {
+  for (const file of [join(cwd, ".pi", "shell-background.json"), join(agentDir, "shell-background.json")]) {
+    let raw: string;
+    try {
+      raw = readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    try {
+      return resolveSettings(JSON.parse(raw), env);
+    } catch (err) {
+      return {
+        settings: DEFAULT_SETTINGS,
+        warnings: [`${file}: ${err instanceof Error ? err.message : String(err)}`],
+      };
+    }
+  }
+  return resolveSettings(undefined, env);
 }
 
 function clamp(name: NumericKey, value: number, warnings: string[]): number {

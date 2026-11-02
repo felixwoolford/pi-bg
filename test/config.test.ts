@@ -1,6 +1,19 @@
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { resolveSettings, DEFAULT_SETTINGS } from "../src/config.ts";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { loadSettings, resolveSettings, DEFAULT_SETTINGS } from "../src/config.ts";
+
+function configDirs(t: TestContext) {
+  const root = mkdtempSync(join(tmpdir(), "sbg-config-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const cwd = join(root, "project");
+  const agentDir = join(root, "agent");
+  mkdirSync(join(cwd, ".pi"), { recursive: true });
+  mkdirSync(agentDir);
+  return { cwd, agentDir, projectFile: join(cwd, ".pi", "shell-background.json"), globalFile: join(agentDir, "shell-background.json") };
+}
 
 test("defaults disable automatic backgrounding", () => {
   const { settings, warnings } = resolveSettings(undefined, {});
@@ -62,4 +75,32 @@ test("a non-boolean deliverResults warns and keeps the default", () => {
   const { settings, warnings } = resolveSettings({ deliverResults: "no" }, {});
   assert.equal(settings.deliverResults, true);
   assert.ok(warnings.some((w) => w.includes("deliverResults")));
+});
+
+test("settings loading prefers project over global without merging, and falls back for unreadable files", (t) => {
+  const { cwd, agentDir, projectFile, globalFile } = configDirs(t);
+  assert.deepEqual(loadSettings(cwd, agentDir, {}), { settings: DEFAULT_SETTINGS, warnings: [] });
+  writeFileSync(globalFile, JSON.stringify({ maxBackground: 2, tailBytes: 8192 }));
+  assert.equal(loadSettings(cwd, agentDir, {}).settings.maxBackground, 2);
+
+  writeFileSync(projectFile, JSON.stringify({ maxBackground: 4 }));
+  const project = loadSettings(cwd, agentDir, {});
+  assert.equal(project.settings.maxBackground, 4);
+  assert.equal(project.settings.tailBytes, DEFAULT_SETTINGS.tailBytes, "global values do not leak into project settings");
+
+  rmSync(projectFile);
+  mkdirSync(projectFile); // A directory cannot be read as a settings file.
+  assert.equal(loadSettings(cwd, agentDir, {}).settings.maxBackground, 2);
+  rmSync(globalFile);
+  assert.deepEqual(loadSettings(cwd, agentDir, {}), { settings: DEFAULT_SETTINGS, warnings: [] });
+});
+
+test("malformed project settings warn and use defaults rather than silently loading global settings", (t) => {
+  const { cwd, agentDir, projectFile, globalFile } = configDirs(t);
+  writeFileSync(globalFile, JSON.stringify({ maxBackground: 2 }));
+  writeFileSync(projectFile, "{broken");
+  const loaded = loadSettings(cwd, agentDir, {});
+  assert.deepEqual(loaded.settings, DEFAULT_SETTINGS);
+  assert.equal(loaded.warnings.length, 1);
+  assert.ok(loaded.warnings[0]!.includes(projectFile), "the warning identifies the broken file");
 });

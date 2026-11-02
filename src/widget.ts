@@ -1,14 +1,61 @@
 /**
  * The aboveEditor box lists running jobs, completed results awaiting handoff,
  * and results handed off or collected in the last 15s.
- * Pure string builder; the extension wraps it in a pi-tui Text.
+ * Includes a pure line builder and a session-scoped rendering/timer controller.
  */
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { deliveryLabel } from "./format.ts";
 import type { Job } from "./types.ts";
 
+const WIDGET = "shell-bg";
 const WIDTH = 54;
 const MAX_ROWS = 8;
+
+interface WidgetOptions {
+  getJobs(): Job[] | undefined;
+  getContext(): ExtensionContext | null;
+  setContext(ctx: ExtensionContext): void;
+}
+
+/** No timer starts until a non-empty widget is rendered. Stop on session shutdown. */
+export function createWidgetController(options: WidgetOptions) {
+  let timer: NodeJS.Timeout | null = null;
+
+  function stopTimer(): void {
+    if (timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+  }
+
+  function render(ctx: ExtensionContext | null = options.getContext()): void {
+    if (!ctx || !ctx.hasUI) return;
+    const jobs = options.getJobs();
+    if (!jobs) return;
+    options.setContext(ctx);
+    const lines = buildWidgetLines(jobs, ctx.ui.theme as unknown as WidgetTheme, Date.now());
+    if (lines.length === 0) {
+      ctx.ui.setWidget(WIDGET, undefined);
+      stopTimer();
+      return;
+    }
+    ctx.ui.setWidget(WIDGET, () => new Text(lines.join("\n"), 0, 0), { placement: "aboveEditor" });
+    // Tick elapsed time and expire handed-off rows even without other events.
+    // Unref'd so a lingering box never holds the host open.
+    if (!timer) {
+      timer = setInterval(() => render(), 1000);
+      timer.unref?.();
+    }
+  }
+
+  function stop(ctx: ExtensionContext | null = options.getContext()): void {
+    stopTimer();
+    if (ctx?.hasUI) ctx.ui.setWidget(WIDGET, undefined);
+  }
+
+  return { render, stop };
+}
 
 export interface WidgetTheme {
   fg(color: string, text: string): string;

@@ -28,25 +28,24 @@ import {
   getShellConfig,
   type ExtensionAPI,
   type ExtensionContext,
-  type CustomMessageEntryDraft,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { constants as osConstants, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, statSync, rmSync } from "node:fs";
+import { readdirSync, statSync, rmSync } from "node:fs";
 
 import { JobRegistry, isAlive } from "./src/registry.ts";
 import { spawnToFile, killTree } from "./src/spawn.ts";
 import { readTail } from "./src/tail.ts";
 import { buildEnv } from "./src/env.ts";
-import { DEFAULT_SETTINGS, resolveSettings, type ShellBgSettings } from "./src/config.ts";
-import { backgroundedResult, deliveryMessage, readyMessage, DELIVERY_TYPE, READY_TYPE, STEERING_TYPE, formatResult, formatList, header } from "./src/format.ts";
+import { DEFAULT_SETTINGS, loadSettings, type ShellBgSettings } from "./src/config.ts";
+import { backgroundedResult, STEERING_TYPE, formatResult, formatList, header } from "./src/format.ts";
+import { createDeliveryController } from "./src/delivery.ts";
 import { sanitizeOutput } from "./src/sanitize.ts";
 import { readFull } from "./src/tail.ts";
 import { STRUCTURED_OUTPUT_MAX_BYTES, bashOutputSchema, buildStructured, type BashStructured } from "./src/structured.ts";
-import { buildWidgetLines } from "./src/widget.ts";
+import { createWidgetController } from "./src/widget.ts";
 import { isDeliveryMode, isFinished } from "./src/types.ts";
 import type { DeliveryMode, Execution, Job } from "./src/types.ts";
 
@@ -60,8 +59,6 @@ type ToolResult = {
   isError?: boolean;
 };
 
-const WIDGET = "shell-bg";
-
 export default function shellBackground(pi: ExtensionAPI) {
   let settings: ShellBgSettings = DEFAULT_SETTINGS;
   let registry: JobRegistry | null = null;
@@ -70,7 +67,6 @@ export default function shellBackground(pi: ExtensionAPI) {
   // Only awaited, transferable calls are exposed to /bg; no public job IDs yet.
   const backgroundRequests = new Map<Execution, (prose: string) => boolean>();
   let lastUiCtx: UiContext | null = null;
-  let widgetTimer: NodeJS.Timeout | null = null;
   // Set on a /reload shutdown: this (old) instance's processes are being handed
   // to the next instance in the same host process, so its settle/delivery
   // closures must go quiet — flush status to disk, but never kill and never
@@ -126,60 +122,17 @@ export default function shellBackground(pi: ExtensionAPI) {
     }
   }
 
-  function loadSettings(cwd: string): string[] {
-    for (const file of [join(cwd, ".pi", "shell-background.json"), join(getAgentDir(), "shell-background.json")]) {
-      let raw: string;
-      try {
-        raw = readFileSync(file, "utf8");
-      } catch {
-        continue;
-      }
-      try {
-        const parsed = resolveSettings(JSON.parse(raw));
-        settings = parsed.settings;
-        return parsed.warnings;
-      } catch (err) {
-        settings = DEFAULT_SETTINGS;
-        return [`${file}: ${err instanceof Error ? err.message : String(err)}`];
-      }
-    }
-    const parsed = resolveSettings(undefined);
-    settings = parsed.settings;
-    return parsed.warnings;
-  }
-
   /** Shell + args, reusing pi's resolution; command rides in argv (not stdin). */
   function shellArgv(): { shell: string; args: string[] } {
     const cfg = getShellConfig();
     return { shell: cfg.shell, args: [...cfg.args] };
   }
 
-  function stopWidgetTimer(): void {
-    if (widgetTimer) {
-      clearInterval(widgetTimer);
-      widgetTimer = null;
-    }
-  }
-
-  function renderWidget(ctx: UiContext | null = lastUiCtx): void {
-    if (!ctx || !ctx.hasUI || !registry) return;
-    lastUiCtx = ctx;
-    const now = Date.now();
-    const lines = buildWidgetLines(registry.all(), ctx.ui.theme as never, now);
-    if (lines.length === 0) {
-      ctx.ui.setWidget(WIDGET, undefined);
-      stopWidgetTimer();
-      return;
-    }
-    ctx.ui.setWidget(WIDGET, (_tui: unknown) => new Text(lines.join("\n"), 0, 0), { placement: "aboveEditor" });
-    // Keep the box live between events: tick the elapsed clock while jobs run and
-    // keep uncollected results visible and clear handed-off results after 15s,
-    // even if nothing else renders. Unref'd, so the box never holds the host open.
-    if (!widgetTimer) {
-      widgetTimer = setInterval(() => renderWidget(), 1000);
-      widgetTimer.unref?.();
-    }
-  }
+  const widget = createWidgetController({
+    getJobs: () => registry?.all(),
+    getContext: () => lastUiCtx,
+    setContext: (ctx) => { lastUiCtx = ctx; },
+  });
 
   // ── run ────────────────────────────────────────────────────────────
 
@@ -205,103 +158,13 @@ export default function shellBackground(pi: ExtensionAPI) {
     };
   }
 
-  function resultMessage(job: Job): Omit<CustomMessageEntryDraft, "type"> {
-    return {
-      customType: DELIVERY_TYPE,
-      content: deliveryMessage(job.id, formatResult(job, settings.tailBytes)),
-      display: true,
-      details: { id: job.id, status: job.status, exitCode: job.exitCode },
-    };
-  }
-
-  /** Immediate idle delivery or full output requested during ongoing work. */
-  function deliver(job: Job): void {
-    pi.sendMessage(resultMessage(job), { deliverAs: "steer", triggerTurn: true });
-  }
-
-  /**
-   * Jobs a shell_status wait is blocking on, by id. Seen on pi 1.0.4 with the
-   * TUI captured: the model waits on a background job with shell_status,
-   * the exit handler delivers the finish as a
-   * follow-up in the same instant the wait returns it, and the model spends a
-   * whole extra turn acknowledging a result it had just reported. While a
-   * wait is active the finish is returned there and marked collected; the
-   * delivery path stands down.
-   */
-  const waiters = new Map<string, number>();
-  const awaited = (job: Job): boolean => (waiters.get(job.id) ?? 0) > 0;
-
-  // Keep full results here until their chosen boundary, rather than eagerly
-  // queueing follow-ups that cannot be withdrawn after a status call collects
-  // them. Activity comes from ctx.isIdle(); notified/delivered are per-job state.
-  const pending = new Set<Job>();
-
-  function enqueueDelivery(job: Job): void {
-    if (handedOff || job.delivered || !settings.deliverResults) return;
-    pending.add(job);
-    if (lastUiCtx?.isIdle()) drainDeliveries("idle");
-  }
-
-  function drainDeliveries(phase: "idle" | "turn" | "followUp"): CustomMessageEntryDraft[] {
-    if (handedOff || !settings.deliverResults) return [];
-    const entries: CustomMessageEntryDraft[] = [];
-    const notices: Job[] = [];
-    for (const job of [...pending]) {
-      if (job.delivered) {
-        pending.delete(job);
-        continue;
-      }
-      // A status wait will collect the result itself. Do not nudge it or send
-      // its result twice, including when another tool finishes in parallel.
-      if (awaited(job)) continue;
-      if (phase !== "turn" || job.delivery === "steer") {
-        if (phase === "followUp") entries.push({ type: "custom_message", ...resultMessage(job) });
-        else deliver(job);
-        job.delivered = true;
-        job.deliveredAt ??= Date.now();
-        pending.delete(job);
-        registry?.persist(job);
-        renderWidget();
-      } else if (job.delivery === "notify" && !job.notified) {
-        notices.push(job);
-      }
-    }
-    if (notices.length > 0) {
-      // Batch ready jobs into one short steering message. This is not full
-      // delivery and is never repeated just because the agent did not collect.
-      pi.sendMessage({
-        customType: READY_TYPE,
-        content: readyMessage(notices.map((job) => job.id)),
-        display: true,
-        details: { ids: notices.map((job) => job.id) },
-      }, { deliverAs: "steer", triggerTurn: true });
-      for (const job of notices) {
-        job.notified = true;
-        registry?.persist(job);
-      }
-    }
-    return entries;
-  }
-
-  /** Deliver a finished background job into the conversation, once. */
-  function scheduleDelivery(job: Job, exit: Promise<unknown>): void {
-    exit
-      .then(() => {
-        // Handed off to a newer instance: only flush the final status to disk
-        // for it to read. Do not mark delivered, touch lastUiCtx, or send through
-        // this stale pi (which would throw and, worse, having already flipped
-        // delivered would stop the new instance from ever delivering).
-        if (handedOff) {
-          registry?.persist(job);
-          return;
-        }
-        enqueueDelivery(job);
-      })
-      .catch(() => {
-        // A /reload can make captured handles throw; delivery is a convenience,
-        // shell_status still collects the result.
-      });
-  }
+  const delivery = createDeliveryController(pi, {
+    getSettings: () => settings,
+    isIdle: () => lastUiCtx?.isIdle() ?? false,
+    isHandedOff: () => handedOff,
+    persist: (job) => registry?.persist(job),
+    onDelivered: widget.render,
+  });
 
   async function runBash(
     params: { command: string; timeout?: number; background?: boolean; delivery?: DeliveryMode },
@@ -358,7 +221,7 @@ export default function shellBackground(pi: ExtensionAPI) {
       execution.endedAt = Date.now();
       if (job) {
         owner.persist(job);
-        if (!handedOff) renderWidget();
+        if (!handedOff) widget.render();
       }
     });
 
@@ -381,8 +244,8 @@ export default function shellBackground(pi: ExtensionAPI) {
       job = owner.register(execution, fromForeground);
       foreground.delete(execution);
       backgroundRequests.delete(execution);
-      renderWidget(ctx);
-      scheduleDelivery(job, settle);
+      widget.render(ctx);
+      delivery.schedule(job, settle);
       const r = backgroundedResult({
         id: job.id,
         command,
@@ -531,30 +394,21 @@ export default function shellBackground(pi: ExtensionAPI) {
       const waitSec = Number.isFinite(params.wait) ? Math.min(300, Math.max(0, Math.floor(params.wait as number))) : 0;
       if (waitSec > 0 && job.status === "running") {
         const deadline = Date.now() + waitSec * 1000;
-        waiters.set(job.id, (waiters.get(job.id) ?? 0) + 1);
+        const releaseDelivery = delivery.hold(job);
         try {
           while (job.status === "running" && Date.now() < deadline && !sig?.aborted) await sleep(250);
         } finally {
-          waiters.set(job.id, Math.max(0, (waiters.get(job.id) ?? 1) - 1));
+          releaseDelivery();
         }
       }
       if (sig?.aborted) {
         // The model never sees an aborted tool result. If the job finished
         // while the wait held delivery back, hand it to the turn-boundary drain
         // (it was not collected here) rather than dropping it.
-        if (isFinished(job) && !job.delivered) enqueueDelivery(job);
+        if (isFinished(job)) delivery.enqueue(job);
         return { content: [{ type: "text", text: `shell_status ${job.id}: wait aborted` }], details: { id: job.id }, isError: true };
       }
-      // Reading a finished job marks it collected so the turn-boundary drain
-      // never also sends it (issue #2). A still-running poll must never do this:
-      // setting delivered here would permanently cancel the promised delivery.
-      if (isFinished(job)) {
-        job.delivered = true;
-        job.deliveredAt ??= Date.now();
-        pending.delete(job);
-        registry.persist(job);
-        renderWidget();
-      }
+      delivery.collect(job);
       return {
         content: [{ type: "text", text: formatResult(job, settings.tailBytes) }],
         details: { id: job.id, status: job.status, exitCode: job.exitCode },
@@ -673,9 +527,9 @@ export default function shellBackground(pi: ExtensionAPI) {
           }
         }
         if (job.status === "running") anyRunning = true;
-        else if (job.background) enqueueDelivery(job);
+        else if (job.background) delivery.enqueue(job);
       }
-      renderWidget(ctx);
+      widget.render(ctx);
       if (!anyRunning) clearInterval(timer);
     }, 1000);
     timer.unref?.();
@@ -685,7 +539,7 @@ export default function shellBackground(pi: ExtensionAPI) {
   // explicitly requested full output or a one-time availability notice.
   pi.on("turn_end", async (_event, ctx) => {
     lastUiCtx = ctx;
-    drainDeliveries(ctx.isIdle() ? "idle" : "turn");
+    delivery.drain(ctx.isIdle() ? "idle" : "turn");
   });
 
   // The agent would otherwise stop: append only results still uncollected
@@ -694,26 +548,27 @@ export default function shellBackground(pi: ExtensionAPI) {
   // This hook tracks no activity state; ctx.isIdle() remains authoritative.
   pi.on("agent_before_settle", async (event, ctx) => {
     lastUiCtx = ctx;
-    const entries = drainDeliveries("followUp");
+    const entries = delivery.drain("followUp");
     if (entries.length > 0) return { entries: [...event.entries, ...entries], continue: true };
   });
 
   pi.on("session_start", async (_event, ctx) => {
     lastUiCtx = ctx;
-    const warnings = loadSettings(ctx.cwd);
+    const loaded = loadSettings(ctx.cwd, getAgentDir());
+    settings = loaded.settings;
     const key = sessionKey(ctx);
     sweepOldDirs(key);
     registry = new JobRegistry(join(ROOT, key));
     registry.load();
     registerBash(ctx.cwd, ctx.hasUI);
-    renderWidget(ctx);
+    widget.render(ctx);
     adoptRunning(ctx);
     // Completed-but-uncollected results also survive reloads, including jobs
     // whose one-time notice was already sent by the previous instance.
     for (const job of registry.all()) {
-      if (isFinished(job) && job.status !== "orphaned") enqueueDelivery(job);
+      if (isFinished(job) && job.status !== "orphaned") delivery.enqueue(job);
     }
-    if (warnings.length > 0 && ctx.hasUI) ctx.ui.notify(`shell-background settings: ${warnings.join("; ")}`, "warning");
+    if (loaded.warnings.length > 0 && ctx.hasUI) ctx.ui.notify(`shell-background settings: ${loaded.warnings.join("; ")}`, "warning");
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
@@ -733,8 +588,7 @@ export default function shellBackground(pi: ExtensionAPI) {
       // (handedOff) and the new instance adopts the still-running ones from the
       // sidecars — that is what registry.ts and the README promise across /reload.
       handedOff = true;
-      stopWidgetTimer();
-      if (ctx.hasUI) ctx.ui.setWidget(WIDGET, undefined);
+      widget.stop(ctx);
       return;
     }
     // quit / new / resume / fork: this session is ending for good. Kill each
@@ -755,7 +609,6 @@ export default function shellBackground(pi: ExtensionAPI) {
         // collects whatever is left behind.
       }
     }
-    stopWidgetTimer();
-    if (ctx.hasUI) ctx.ui.setWidget(WIDGET, undefined);
+    widget.stop(ctx);
   });
 }
