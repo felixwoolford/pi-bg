@@ -1,8 +1,10 @@
 /**
- * The aboveEditor box listing background jobs — running ones, and any that
- * finished in the last 15s so a completion is visible before it disappears.
+ * The aboveEditor box lists running jobs, completed results awaiting handoff,
+ * and results handed off or collected in the last 15s.
  * Pure string builder; the extension wraps it in a pi-tui Text.
  */
+import { truncateToWidth } from "@earendil-works/pi-tui";
+import { deliveryLabel } from "./format.ts";
 import type { Job } from "./types.ts";
 
 const WIDTH = 54;
@@ -53,12 +55,14 @@ function clip(text: string, max: number): string {
 export function buildWidgetLines(jobs: Job[], theme: WidgetTheme, now: number): string[] {
   const dim = (s: string) => theme.fg("dim", s);
   const visible = jobs
-    .filter((j) => j.background && (j.status === "running" || (j.endedAt ?? 0) > now - 15_000))
+    .filter((j) => j.background && (j.status === "running" || !j.delivered ||
+      (j.deliveredAt ?? j.endedAt ?? 0) > now - 15_000))
     .sort((a, b) => a.startedAt - b.startedAt);
   if (visible.length === 0) return [];
 
   const running = visible.filter((j) => j.status === "running").length;
-  const title = ` ⚙ shell-bg · ${running} running `;
+  const ready = visible.filter((j) => j.status !== "running" && !j.delivered).length;
+  const title = ` ⚙ shell-bg · ${running} running · ${ready} ready `;
   const hint = " /shell-bg ";
   const pad = Math.max(1, WIDTH - title.length - hint.length);
   const lines = [dim(`╭${title}${"─".repeat(pad)}${hint}╮`)];
@@ -67,9 +71,11 @@ export function buildWidgetLines(jobs: Job[], theme: WidgetTheme, now: number): 
   const hidden = visible.length - shown.length;
   for (const j of shown) {
     const c = color(j);
-    lines.push(
-      `${theme.fg(c, icon(j))} ${theme.fg(c, j.id)} ${dim(`· ${elapsed(j, now)}`)} ${dim(clip(j.command, 28))}`,
-    );
+    const state = j.status !== "running" && !j.delivered ? " · ready" : "";
+    lines.push(truncateToWidth(
+      `${theme.fg(c, icon(j))} ${theme.fg(c, j.id)} ${dim(`[${deliveryLabel(j.delivery)}] · ${elapsed(j, now)}${state}`)} ${dim(clip(j.command, 28))}`,
+      WIDTH,
+    ));
   }
   if (hidden > 0) lines.push(dim(`│ … +${hidden} more`));
   lines.push(dim(`╰${"─".repeat(WIDTH)}╯`));

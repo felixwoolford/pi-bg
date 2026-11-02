@@ -14,8 +14,8 @@
 import { mkdirSync, writeFileSync, renameSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { Execution, Job } from "./types.ts";
-import { isRecord } from "./types.ts";
+import type { DeliveryMode, Execution, Job } from "./types.ts";
+import { isDeliveryMode, isRecord } from "./types.ts";
 
 export function isAlive(pid: number | null | undefined): boolean {
   if (!pid || pid <= 0) return false;
@@ -55,7 +55,7 @@ export class JobRegistry {
   }
 
   /** Private execution state: no public id, counter allocation, or sidecar. */
-  createExecution(command: string, cwd: string): Execution {
+  createExecution(command: string, cwd: string, delivery: DeliveryMode = "notify"): Execution {
     return {
       command,
       cwd,
@@ -69,6 +69,8 @@ export class JobRegistry {
       endedAt: null,
       background: false,
       fromForeground: false,
+      delivery,
+      notified: false,
       delivered: false,
     };
   }
@@ -151,6 +153,8 @@ export class JobRegistry {
         if (typeof job.background !== "boolean") job.background = true;
         // Preserve IDs and provenance of legacy automatically backgrounded jobs.
         if (typeof job.fromForeground !== "boolean") job.fromForeground = job.id.startsWith("fg-");
+        if (!isDeliveryMode(job.delivery)) job.delivery = "notify";
+        if (typeof job.notified !== "boolean") job.notified = false;
         if (job.status === "running") {
           if (job.hostPid !== process.pid) {
             job.status = "orphaned";

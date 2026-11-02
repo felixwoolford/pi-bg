@@ -9,6 +9,7 @@ Explicit background shell jobs in [pi](https://github.com/earendil-works/pi). Pa
 ```text
 bash { command: "npm run build" }                   # await the prerequisite result
 bash { command: "npm run dev", background: true }   # return bg-1 immediately
+bash { command: "npm test", background: true, delivery: "followUp" } # full result after current work
 shell_status { id: "bg-1" }                         # status and output so far
 shell_status { id: "bg-1", wait: 60 }               # wait up to 60s for completion
 shell_status                                       # list background jobs
@@ -30,7 +31,7 @@ While a foreground shell command runs, submit:
 
 Pi executes `/bg` immediately, even while the agent is awaiting the tool. It transfers the existing process without restarting or cancelling it, assigns an `fg-N` job ID, and releases that tool call. With multiple foreground calls, a picker lets you choose one; the others remain awaited. Consequently, an outstanding sibling tool call can still hold up the agent's next response.
 
-The extension queues a visible steering message **before** releasing the tool. With `/bg` alone it contains only the backgrounding template. With prose it contains your text followed by that template. The template identifies the job, states that its result is still pending, and explains how to collect it; it does not imply success or permission to perform dependent work. The tool result carries the current output and job handle. Completion arrives separately.
+The extension queues a visible steering message **before** releasing the tool. With `/bg` alone it contains only the backgrounding template. With prose it contains your text followed by that template. The template identifies the job, states that its result is still pending, and explains how to collect it; it does not imply success or permission to perform dependent work. The tool result carries the current output and job handle. Completion arrives separately, using the original call's `delivery` choice (default `notify`). `/bg` itself always steers immediately, regardless of that choice.
 
 Cancelling the picker changes nothing. If the selected call finishes or is cancelled while the picker is open, no other task is substituted. If no foreground call is available or the background limit is full, the extension notifies you and sends no steering message. Without a UI, multiple calls cannot be selected and are left unchanged.
 
@@ -51,17 +52,31 @@ IDs are assigned **only when a command enters the background**:
 
 Each prefix has its own session counter: `bg-1`, `fg-1`, `bg-2`, `fg-2`. Ordinary foreground runs consume neither counter and never appear in `shell_status`, the widget, or persisted job records. IDs and both counters survive `/reload`; legacy automatically backgrounded jobs retain their IDs.
 
-The widget above the editor shows running background jobs and jobs completed in the last 15 seconds. Its prefixes distinguish jobs backgrounded at launch from transferred foreground jobs.
+The widget above the editor shows each job's delivery mode: `[notify]`, `[steer]`, or `[follow-up]`. Its prefixes distinguish jobs backgrounded at launch from transferred foreground jobs.
+
+Finished results remain visible as **ready** until the full result is handed off or collected with `shell_status`; a readiness notice alone does not clear them. Afterwards, the row remains for 15 seconds measured from handoff/collection, not process completion. Handoff means delivery to the conversation, not proof the model has considered the result. Jobs remain available through `shell_status` after their widget rows disappear.
 
 ## Completion delivery
 
-An uncollected background result is pushed into the conversation once, at the next safe turn boundary before the next model request, or immediately if Pi's `ctx.isIdle()` reports that the agent is idle. Activity comes from Pi directly, not extension-maintained lifecycle flags. Collecting a finished job with `shell_status` suppresses duplicate delivery. Polling a still-running job does not cancel its eventual delivery.
+Each call can choose `delivery`. The tool schema explains each choice in plain English:
+
+| Choice | While the agent is working |
+|---|---|
+| `notify` (default) | Tell me once that the result is ready; give me the full output when I finish, unless I collect it first. |
+| `steer` | Give me the full result at the next safe opportunity, even while I am working. |
+| `followUp` | Let me finish my current work, then give me the full result, without an earlier notice. |
+
+All three deliver the full result immediately if Pi's `ctx.isIdle()` reports that the agent is idle. Activity comes from Pi directly, not extension-maintained lifecycle flags. A safe opportunity during work is the end of the current tool batch, before the next model request. A follow-up arrives when the agent would otherwise finish and return control to you; it does not wait for your next message.
+
+Ready notices contain job IDs, not command output. Several ready jobs share one short steering notice. The notice is sent **once per job**, never repeatedly until acknowledged. A notice does not consume the full result.
+
+Collecting a finished job with `shell_status` suppresses its automatic full-result delivery, even after a ready notice. Full follow-ups are assembled from the still-uncollected results at the delivery boundary, not queued irrevocably in advance. Polling a running job does not cancel its eventual delivery. The delivery choice and notice state survive `/reload`, including completed results awaiting a follow-up.
 
 In interactive sessions with automatic delivery enabled, no status check is required. Use `shell_status` for progress or to explicitly wait for a result.
 
 Under headless `pi -p`, collect results within the same run using `shell_status { id, wait: N }`: the session does not remain alive after the prompt completes. `wait` is clamped to 0–300 seconds.
 
-Set `deliverResults: false` to disable automatic completion delivery while keeping the widget and status tools. This does not suppress user-triggered `/bg` steering messages.
+Set `deliverResults: false` to disable all automatic completion delivery and ready notices while keeping the widget and status tools. This does not suppress user-triggered `/bg` steering messages.
 
 ## Execution and output
 

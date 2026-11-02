@@ -29,7 +29,7 @@ test("formatResult hands the model a cleaned tail while the log on disk keeps ev
     writeFileSync(logPath, raw);
     const job: Job = {
       id: "bg-1", command: "npm run build", cwd: "/x", pid: 1, status: "done", exitCode: 0, signal: null,
-      logPath, startedAt: 0, endedAt: 10, background: true, fromForeground: false, delivered: false,
+      logPath, startedAt: 0, endedAt: 10, background: true, fromForeground: false, delivery: "notify", notified: false, delivered: false,
     };
     const text = formatResult(job, 65536);
     assert.ok(!text.includes("\u001B"), text);

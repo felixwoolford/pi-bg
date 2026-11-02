@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import shellBackground from "../index.ts";
-import { DELIVERY_TYPE, STEERING_TYPE } from "../src/format.ts";
+import { DELIVERY_TYPE, READY_TYPE, STEERING_TYPE } from "../src/format.ts";
 
 // Isolate from the developer's own settings: the extension reads
 // <agentDir>/shell-background.json, which would otherwise leak into every test
@@ -38,7 +38,19 @@ function harness(): Harness {
   const pi = {
     registerTool: (tool: AnyTool) => tools.set(tool.name, tool),
     registerCommand: (name: string, command: { handler: AnyHandler }) => commands.set(name, command),
-    on: (event: string, handler: AnyHandler) => handlers.set(event, handler),
+    on: (event: string, handler: AnyHandler) => handlers.set(event, async (payload, ctx) => {
+      const result = await handler(payload, ctx);
+      // Pi commits returned boundary entries before making the requested
+      // continuation. Model that separately from queued steering messages.
+      for (const entry of result?.entries ?? []) {
+        if (entry.type === "custom_message") {
+          const { type: _type, ...message } = entry;
+          sent.push(message);
+          sendOptions.push({ boundary: event });
+        }
+      }
+      return result;
+    }),
     sendMessage: (msg: unknown, options: unknown) => { sent.push(msg); sendOptions.push(options); },
   };
   return { pi: pi as unknown as ExtensionAPI, tools, handlers, commands, sent, sendOptions };
@@ -66,6 +78,12 @@ function makeCtx(cwd: string, hasUI: boolean, sessionId?: string): ExtensionCont
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+async function finishWork(h: Harness, ctx: ExtensionContext): Promise<any> {
+  return h.handlers.get("agent_before_settle")!({
+    type: "agent_before_settle", entries: [], continue: false, context: { canContinue: false },
+  }, ctx);
+}
 
 async function rmDir(p: string): Promise<void> {
   rmSync(p, { recursive: true, force: true });
@@ -249,6 +267,9 @@ test("already-aborted calls and invalid timeouts do not start a command", async 
     for (const timeout of [0, -1, NaN, Infinity, 2147484]) {
       await assert.rejects(bash.execute("invalid", { command: "touch unwanted", timeout }, undefined, undefined, ctx), /Invalid timeout/);
     }
+    await assert.rejects(bash.execute("invalid-delivery", {
+      command: "touch unwanted", background: true, delivery: "unknown",
+    }, undefined, undefined, ctx), /Invalid delivery/);
     assert.equal(existsSync(join(cwd, "unwanted")), false);
     assert.deepEqual(readdirSync(join(regDir, "logs")), [], "no process or log was started");
   } finally {
@@ -700,6 +721,7 @@ test("/bg preserves steering prose, releases the tool, and delivers the eventual
     let returned = false;
     running = h.tools.get("bash")!.execute("foreground", {
       command: "echo before; touch ready; while [ ! -e finish ]; do sleep 0.02; done; echo after",
+      delivery: "followUp",
     }, undefined, undefined, ctx).then((result) => { returned = true; return result; });
     await waitFor(() => existsSync(join(cwd, "ready")), 2000);
     const prose = "Inspect the documentation meanwhile.\nDo not change files until the command finishes.";
@@ -719,12 +741,16 @@ test("/bg preserves steering prose, releases the tool, and delivers the eventual
 
     writeFileSync(join(cwd, "finish"), "");
     await waitFor(() => JSON.parse(readFileSync(join(regDir, "fg-1.json"), "utf8")).status === "done", 3000);
-    assert.equal(h.sent.length, 1, "completion waits until the tool batch ends");
+    assert.equal(h.sent.length, 1, "the user-requested steering is independent of completion policy");
     await h.handlers.get("turn_end")!({ type: "turn_end" }, ctx);
+    assert.equal(h.sent.length, 1, "followUp sends no availability notice or full output during ongoing work");
+    await finishWork(h, ctx);
     assert.equal(h.sent.length, 2);
     assert.equal(h.sent[1].customType, DELIVERY_TYPE);
     assert.match(h.sent[1].content, /before\nafter/);
+    assert.deepEqual(h.sendOptions[1], { boundary: "agent_before_settle" });
     await h.handlers.get("turn_end")!({ type: "turn_end" }, ctx);
+    await finishWork(h, ctx);
     assert.equal(h.sent.length, 2, "no duplicate completion");
   } finally {
     await teardown(h, ctx);
@@ -904,7 +930,148 @@ test("/bg rechecks the background limit after the picker yields", async () => {
   }
 });
 
-test("busy completions arrive at the next tool boundary; native idle completions need no boundary", async () => {
+for (const { name, delivery, notice } of [
+  { name: "default notify", delivery: undefined, notice: true },
+  { name: "explicit notify", delivery: "notify", notice: true },
+  { name: "quiet follow-up", delivery: "followUp", notice: false },
+]) {
+  test(`${name}: full output waits until current work ends; idle delivery is immediate`, async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "sbg-delivery-"));
+    const { id: sid, regDir } = uniqueSession();
+    const h = harness();
+    const ctx = makeCtx(cwd, true, sid);
+    ctx.isIdle = () => false;
+    try {
+      shellBackground(h.pi);
+      await h.handlers.get("session_start")!({ type: "session_start" }, ctx);
+      const started = await h.tools.get("bash")!.execute("background", {
+        command: "echo full-output-must-not-be-in-the-notice", background: true, delivery,
+      }, undefined, undefined, ctx);
+      assert.equal(started.details.delivery, delivery ?? "notify");
+      await waitFor(() => JSON.parse(readFileSync(join(regDir, "bg-1.json"), "utf8")).status === "done", 3000);
+      assert.equal(h.sent.length, 0);
+      await h.handlers.get("turn_end")!({ type: "turn_end" }, ctx);
+      assert.equal(h.sent.length, notice ? 1 : 0);
+      if (notice) {
+        assert.equal(h.sent[0].customType, READY_TYPE);
+        assert.deepEqual(h.sent[0].details.ids, ["bg-1"]);
+        assert.doesNotMatch(h.sent[0].content, /full-output-must-not-be-in-the-notice/);
+        assert.deepEqual(h.sendOptions[0], { deliverAs: "steer", triggerTurn: true });
+      }
+      await h.handlers.get("turn_end")!({ type: "turn_end" }, ctx);
+      assert.equal(h.sent.length, notice ? 1 : 0, "no repeated reminder");
+      const disk = JSON.parse(readFileSync(join(regDir, "bg-1.json"), "utf8"));
+      assert.equal(disk.notified, notice);
+      assert.equal(disk.delivered, false, "a notice does not consume the full result");
+      assert.equal(disk.deliveredAt, undefined, "a notice must not start the widget's expiry clock");
+
+      // Other boundary handlers' drafts must survive our appended results.
+      const inherited = { type: "custom", customType: "another-extension", data: 42 };
+      const result = await h.handlers.get("agent_before_settle")!({
+        type: "agent_before_settle", entries: [inherited], context: { canContinue: false },
+      }, ctx);
+      assert.equal(result.continue, true);
+      assert.deepEqual(result.entries[0], inherited);
+      assert.equal(h.sent.length, notice ? 2 : 1);
+      assert.equal(h.sent.at(-1).customType, DELIVERY_TYPE);
+      assert.match(h.sent.at(-1).content, /full-output-must-not-be-in-the-notice/);
+      assert.deepEqual(h.sendOptions.at(-1), { boundary: "agent_before_settle" });
+      const handedOff = JSON.parse(readFileSync(join(regDir, "bg-1.json"), "utf8"));
+      assert.equal(typeof handedOff.deliveredAt, "number", "full delivery starts the widget's grace period");
+      await h.handlers.get("turn_end")!({ type: "turn_end" }, ctx);
+      assert.equal(await finishWork(h, ctx), undefined, "delivered results cannot create a continuation loop");
+      assert.equal(h.sent.length, notice ? 2 : 1);
+
+      ctx.isIdle = () => true;
+      await h.tools.get("bash")!.execute("idle", { command: "echo idle-result", background: true, delivery }, undefined, undefined, ctx);
+      await waitFor(() => h.sent.length === (notice ? 3 : 2), 3000);
+      assert.equal(h.sent.at(-1).customType, DELIVERY_TYPE);
+      assert.match(h.sent.at(-1).content, /idle-result/);
+    } finally {
+      await teardown(h, ctx);
+      await rmDir(cwd);
+      await rmDir(regDir);
+    }
+  });
+}
+
+test("ready notices are batched once; collecting a result suppresses its full follow-up", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "sbg-notice-batch-"));
+  const { id: sid, regDir } = uniqueSession();
+  const h = harness();
+  const ctx = makeCtx(cwd, true, sid);
+  ctx.isIdle = () => false;
+  try {
+    shellBackground(h.pi);
+    await h.handlers.get("session_start")!({ type: "session_start" }, ctx);
+    const bash = h.tools.get("bash")!;
+    await bash.execute("first", { command: "echo output-one", background: true }, undefined, undefined, ctx);
+    await bash.execute("second", { command: "echo output-two", background: true }, undefined, undefined, ctx);
+    await waitFor(() => ["bg-1", "bg-2"].every((id) =>
+      JSON.parse(readFileSync(join(regDir, `${id}.json`), "utf8")).status === "done"), 3000);
+    await h.handlers.get("turn_end")!({ type: "turn_end" }, ctx);
+    assert.equal(h.sent.length, 1);
+    assert.equal(h.sent[0].customType, READY_TYPE);
+    assert.deepEqual(h.sent[0].details.ids, ["bg-1", "bg-2"]);
+    const collected = await h.tools.get("shell_status")!.execute("collect", { id: "bg-1" });
+    assert.match(collected.structuredContent.output, /output-one/);
+    const collectedAt = JSON.parse(readFileSync(join(regDir, "bg-1.json"), "utf8")).deliveredAt;
+    assert.equal(typeof collectedAt, "number");
+    await h.tools.get("shell_status")!.execute("collect-again", { id: "bg-1" });
+    assert.equal(JSON.parse(readFileSync(join(regDir, "bg-1.json"), "utf8")).deliveredAt, collectedAt, "rereading a result does not restart expiry");
+    await h.handlers.get("turn_end")!({ type: "turn_end" }, ctx);
+    assert.equal(h.sent.length, 1, "neither result gets a repeated notice");
+    await finishWork(h, ctx);
+    assert.equal(h.sent.length, 2);
+    assert.equal(h.sent[1].details.id, "bg-2");
+    assert.match(h.sent[1].content, /output-two/);
+    assert.doesNotMatch(h.sent[1].content, /output-one/);
+    await finishWork(h, ctx);
+    assert.equal(h.sent.length, 2);
+  } finally {
+    await teardown(h, ctx);
+    await rmDir(cwd);
+    await rmDir(regDir);
+  }
+});
+
+test("reload retains a sent notice and restores its uncollected full result", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "sbg-notice-reload-"));
+  const { id: sid, regDir } = uniqueSession();
+  const a = harness();
+  const b = harness();
+  const ctxA = makeCtx(cwd, true, sid);
+  const ctxB = makeCtx(cwd, true, sid);
+  ctxA.isIdle = ctxB.isIdle = () => false;
+  try {
+    shellBackground(a.pi);
+    await a.handlers.get("session_start")!({ type: "session_start" }, ctxA);
+    await a.tools.get("bash")!.execute("background", { command: "echo reload-output", background: true }, undefined, undefined, ctxA);
+    await waitFor(() => JSON.parse(readFileSync(join(regDir, "bg-1.json"), "utf8")).status === "done", 3000);
+    await a.handlers.get("turn_end")!({ type: "turn_end" }, ctxA);
+    assert.equal(a.sent[0].customType, READY_TYPE);
+    await a.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "reload" }, ctxA);
+
+    shellBackground(b.pi);
+    await b.handlers.get("session_start")!({ type: "session_start" }, ctxB);
+    await b.handlers.get("turn_end")!({ type: "turn_end" }, ctxB);
+    assert.equal(b.sent.length, 0, "the already-sent notice is not repeated");
+    await finishWork(b, ctxB);
+    assert.equal(b.sent.length, 1);
+    assert.equal(b.sent[0].customType, DELIVERY_TYPE);
+    assert.match(b.sent[0].content, /reload-output/);
+    assert.equal(a.sent.length, 1, "the handed-off instance sends no full result");
+    await finishWork(b, ctxB);
+    assert.equal(b.sent.length, 1);
+  } finally {
+    await teardown(b, ctxB);
+    await teardown(a, ctxA);
+    await rmDir(cwd);
+    await rmDir(regDir);
+  }
+});
+
+test("steer delivers full output at the next tool boundary; idle delivery needs no boundary", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "sbg-boundary-"));
   const { id: sid, regDir } = uniqueSession();
   const h = harness();
@@ -916,7 +1083,7 @@ test("busy completions arrive at the next tool boundary; native idle completions
     await h.handlers.get("session_start")!({ type: "session_start" }, ctx);
     const bash = h.tools.get("bash")!;
     const started = await bash.execute("background", {
-      command: "sleep 0.05; echo background-complete; touch background-done", background: true,
+      command: "sleep 0.05; echo background-complete; touch background-done", background: true, delivery: "steer",
     }, undefined, undefined, ctx);
     assert.match(started.content[0].text, /Completion will be delivered automatically; no status check is required/);
     const foreground = await bash.execute("foreground", {

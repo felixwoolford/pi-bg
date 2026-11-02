@@ -44,7 +44,8 @@ test("persist writes a sidecar and load restores + continues the counter", () =>
   const dir = baseDir();
   try {
     const r1 = new JobRegistry(dir);
-    const j = r1.register(r1.createExecution("sleep 1", "/x"), false);
+    const j = r1.register(r1.createExecution("sleep 1", "/x", "followUp"), false);
+    j.notified = true;
     j.pid = 999_999_999; // almost certainly not a live pid
     r1.persist(j);
     assert.ok(readdirSync(dir).some((f) => f === "bg-1.json"));
@@ -57,6 +58,8 @@ test("persist writes a sidecar and load restores + continues the counter", () =>
     assert.ok(restored);
     assert.equal(restored!.status, "done", "a running job with a dead pid settles");
     assert.equal(restored!.background, true);
+    assert.equal(restored!.delivery, "followUp");
+    assert.equal(restored!.notified, true);
     assert.equal(r2.register(r2.createExecution("echo next", "/x"), false).id, "bg-2");
     assert.equal(r2.register(r2.createExecution("echo moved", "/x"), true).id, "fg-1", "the transfer counter is independent");
   } finally {
@@ -153,12 +156,14 @@ test("legacy automatically backgrounded jobs retain their IDs and foreground pro
     const first = new JobRegistry(dir);
     const legacy = {
       ...first.createExecution("echo old", "/x"), id: "fg-3", status: "done", background: true,
-      fromForeground: undefined, auto: true,
+      fromForeground: undefined, auto: true, delivery: undefined, notified: undefined,
     };
     writeFileSync(join(dir, "fg-3.json"), JSON.stringify(legacy));
     const restored = new JobRegistry(dir);
     restored.load();
     assert.equal(restored.get("fg-3")?.fromForeground, true);
+    assert.equal(restored.get("fg-3")?.delivery, "notify");
+    assert.equal(restored.get("fg-3")?.notified, false);
     assert.equal(restored.register(restored.createExecution("echo new", "/x"), true).id, "fg-4");
   } finally {
     rmSync(dir, { recursive: true, force: true });

@@ -11,7 +11,7 @@ export interface ShellBgSettings {
   tailBytes: number;
   /** Maximum live background jobs. Foreground execution does not count. */
   maxBackground: number;
-  /** Deliver uncollected background results at a safe turn boundary, or immediately while idle. */
+  /** Automatically report uncollected results using each job's delivery choice. */
   deliverResults: boolean;
 }
 

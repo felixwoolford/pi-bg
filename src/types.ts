@@ -4,6 +4,11 @@
  */
 
 export type JobStatus = "running" | "done" | "failed" | "killed" | "orphaned";
+export type DeliveryMode = "notify" | "steer" | "followUp";
+
+export function isDeliveryMode(value: unknown): value is DeliveryMode {
+  return value === "notify" || value === "steer" || value === "followUp";
+}
 
 export interface Execution {
   /** Assigned only when backgrounded: bg-N at launch, fg-N transferred by the user. */
@@ -33,8 +38,14 @@ export interface Execution {
   background: boolean;
   /** True when transferred from a foreground call rather than backgrounded at launch. */
   fromForeground: boolean;
-  /** Whether the finished result has been delivered back to the conversation. */
+  /** How to report completion while the agent is busy. Idle agents receive the full result. */
+  delivery: DeliveryMode;
+  /** Whether the one-time result-ready notice has been sent (not full-result delivery). */
+  notified: boolean;
+  /** Whether the finished result has been delivered or collected with shell_status. */
   delivered: boolean;
+  /** Time the full result was handed off or collected, not proof the model read it. */
+  deliveredAt?: number;
   /** Set when we killed it (timeout/abort/shell_kill), so exit reads as killed. */
   killedByUs?: boolean;
 }

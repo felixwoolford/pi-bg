@@ -1,5 +1,5 @@
 /** Formatting command results, background job lists, and lifecycle messages. */
-import type { Execution, Job } from "./types.ts";
+import type { DeliveryMode, Execution, Job } from "./types.ts";
 import { readTail } from "./tail.ts";
 import { sanitizeOutput } from "./sanitize.ts";
 
@@ -40,6 +40,10 @@ export function formatResult(job: Execution, tailBytes: number): string {
   return lines.join("\n");
 }
 
+export function deliveryLabel(delivery: DeliveryMode): string {
+  return delivery === "followUp" ? "follow-up" : delivery;
+}
+
 /** A roster of background jobs for shell_status with no id. */
 export function formatList(jobs: Job[]): string {
   if (jobs.length === 0) return "No background commands this session.";
@@ -49,7 +53,7 @@ export function formatList(jobs: Job[]): string {
     .map((j) => {
       const cmd = j.command.replace(/\s+/g, " ").trim();
       const short = cmd.length <= 48 ? cmd : `${cmd.slice(0, 47)}…`;
-      return `${header(j)}  ${short}`;
+      return `${header(j)} [${deliveryLabel(j.delivery)}]  ${short}`;
     });
   return [`${jobs.filter((j) => j.status === "running").length} running, ${jobs.length} total:`, ...rows].join("\n");
 }
@@ -62,6 +66,7 @@ export interface BackgroundedInput {
   fromForeground: boolean;
   /** Whether uncollected results will be delivered automatically. */
   deliverResults: boolean;
+  delivery: DeliveryMode;
   /** Whether a UI/interactive session is present to deliver into. */
   interactive: boolean;
   /** The tool to collect with, e.g. "shell_status". */
@@ -87,6 +92,7 @@ export interface BackgroundedResult {
     status: "running";
     background: true;
     fromForeground: boolean;
+    delivery: DeliveryMode;
     retryable: true;
     pollRequired: boolean;
     elapsedMs: number;
@@ -98,6 +104,7 @@ export function backgroundedResult(input: BackgroundedInput): BackgroundedResult
   const head = input.fromForeground
     ? `The user moved ${input.id} to the background after ${elapsed(input.elapsedMs)} without cancelling it.`
     : `${input.id} started in the background.`;
+  const mode = `Delivery: ${deliveryLabel(input.delivery)}.`;
   const line = `  $ ${clip(input.command)}`;
   const tail = !input.interactive
     ? [
@@ -108,7 +115,12 @@ export function backgroundedResult(input: BackgroundedInput): BackgroundedResult
     : input.deliverResults
       ? [
           "Completion will be delivered automatically; no status check is required.",
-          `Use ${input.collectWith} only for progress or to explicitly wait for a result.`,
+          input.delivery === "notify"
+            ? "While you work, one short notice announces completion; the full result follows when you finish, unless collected first."
+            : input.delivery === "steer"
+              ? "The full result arrives at the next safe opportunity, even while you are working."
+              : "The full result arrives after your current work, without an earlier notice.",
+          `Use ${input.collectWith} for progress or to explicitly wait for a result.`,
         ]
       : [
           "Automatic result delivery is disabled.",
@@ -116,12 +128,13 @@ export function backgroundedResult(input: BackgroundedInput): BackgroundedResult
         ];
   tail.unshift("The command is still running, not completed or verified. Only proceed with work independent of its result.");
   return {
-    text: [head, line, "", ...tail].join("\n"),
+    text: [head, mode, line, "", ...tail].join("\n"),
     details: {
       id: input.id,
       status: "running",
       background: true,
       fromForeground: input.fromForeground,
+      delivery: input.delivery,
       retryable: true,
       pollRequired: !input.interactive || !input.deliverResults,
       elapsedMs: input.elapsedMs,
@@ -136,13 +149,19 @@ export function deliveryMessage(id: string, body: string): string {
     body.trim(),
     `</shell_background_result>`,
     "",
-    `This is ${id}, a command you sent to the background; it has just finished and this is its result.`,
-    "Fold it into what you are doing. If you had already moved on, say what it changes — or that it changes nothing.",
+    `Completed result for ${id}, a command you sent to the background.`,
   ].join("\n");
+}
+
+/** A short availability notice, without the command's output or a repeated reminder. */
+export function readyMessage(ids: string[]): string {
+  return `Background result${ids.length === 1 ? "" : "s"} ready: ${ids.join(", ")}. ` +
+    "Use shell_status if useful now; otherwise the full result will arrive as a follow-up.";
 }
 
 /** The custom-message type a delivered result travels under. */
 export const DELIVERY_TYPE = "shell-background-result";
+export const READY_TYPE = "shell-background-ready";
 
 /** The user-triggered background-and-steer message, distinct from a finished result. */
 export const STEERING_TYPE = "shell-background-steering";

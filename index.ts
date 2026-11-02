@@ -28,6 +28,7 @@ import {
   getShellConfig,
   type ExtensionAPI,
   type ExtensionContext,
+  type CustomMessageEntryDraft,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -41,13 +42,13 @@ import { spawnToFile, killTree } from "./src/spawn.ts";
 import { readTail } from "./src/tail.ts";
 import { buildEnv } from "./src/env.ts";
 import { DEFAULT_SETTINGS, resolveSettings, type ShellBgSettings } from "./src/config.ts";
-import { backgroundedResult, deliveryMessage, DELIVERY_TYPE, STEERING_TYPE, formatResult, formatList, header } from "./src/format.ts";
+import { backgroundedResult, deliveryMessage, readyMessage, DELIVERY_TYPE, READY_TYPE, STEERING_TYPE, formatResult, formatList, header } from "./src/format.ts";
 import { sanitizeOutput } from "./src/sanitize.ts";
 import { readFull } from "./src/tail.ts";
 import { STRUCTURED_OUTPUT_MAX_BYTES, bashOutputSchema, buildStructured, type BashStructured } from "./src/structured.ts";
 import { buildWidgetLines } from "./src/widget.ts";
-import { isFinished } from "./src/types.ts";
-import type { Execution, Job } from "./src/types.ts";
+import { isDeliveryMode, isFinished } from "./src/types.ts";
+import type { DeliveryMode, Execution, Job } from "./src/types.ts";
 
 type UiContext = ExtensionContext;
 type AnyTool = { name: string; execute: (...a: never[]) => unknown; [k: string]: unknown };
@@ -172,8 +173,8 @@ export default function shellBackground(pi: ExtensionAPI) {
     }
     ctx.ui.setWidget(WIDGET, (_tui: unknown) => new Text(lines.join("\n"), 0, 0), { placement: "aboveEditor" });
     // Keep the box live between events: tick the elapsed clock while jobs run and
-    // clear a finished job once it falls out of its 15s window, even if nothing
-    // else fires a render. Unref'd, so a lingering box never holds the host open.
+    // keep uncollected results visible and clear handed-off results after 15s,
+    // even if nothing else renders. Unref'd, so the box never holds the host open.
     if (!widgetTimer) {
       widgetTimer = setInterval(() => renderWidget(), 1000);
       widgetTimer.unref?.();
@@ -204,19 +205,18 @@ export default function shellBackground(pi: ExtensionAPI) {
     };
   }
 
-  /** Push a finished job's result into the conversation through the live pi. */
+  function resultMessage(job: Job): Omit<CustomMessageEntryDraft, "type"> {
+    return {
+      customType: DELIVERY_TYPE,
+      content: deliveryMessage(job.id, formatResult(job, settings.tailBytes)),
+      display: true,
+      details: { id: job.id, status: job.status, exitCode: job.exitCode },
+    };
+  }
+
+  /** Immediate idle delivery or full output requested during ongoing work. */
   function deliver(job: Job): void {
-    renderWidget();
-    if (!settings.deliverResults) return;
-    pi.sendMessage(
-      {
-        customType: DELIVERY_TYPE,
-        content: deliveryMessage(job.id, formatResult(job, settings.tailBytes)),
-        display: true,
-        details: { id: job.id, status: job.status, exitCode: job.exitCode },
-      },
-      { deliverAs: "steer", triggerTurn: true },
-    );
+    pi.sendMessage(resultMessage(job), { deliverAs: "steer", triggerTurn: true });
   }
 
   /**
@@ -231,31 +231,56 @@ export default function shellBackground(pi: ExtensionAPI) {
   const waiters = new Map<string, number>();
   const awaited = (job: Job): boolean => (waiters.get(job.id) ?? 0) > 0;
 
-  // While Pi is busy, hold completions until the tool batch ends. A status
-  // call in that batch can collect a result first, suppressing duplicate
-  // delivery. Idle completions wake the agent immediately.
+  // Keep full results here until their chosen boundary, rather than eagerly
+  // queueing follow-ups that cannot be withdrawn after a status call collects
+  // them. Activity comes from ctx.isIdle(); notified/delivered are per-job state.
   const pending = new Set<Job>();
 
   function enqueueDelivery(job: Job): void {
-    if (handedOff || job.delivered) return;
+    if (handedOff || job.delivered || !settings.deliverResults) return;
     pending.add(job);
-    if (lastUiCtx?.isIdle()) drainDeliveries();
+    if (lastUiCtx?.isIdle()) drainDeliveries("idle");
   }
 
-  function drainDeliveries(): void {
+  function drainDeliveries(phase: "idle" | "turn" | "followUp"): CustomMessageEntryDraft[] {
+    if (handedOff || !settings.deliverResults) return [];
+    const entries: CustomMessageEntryDraft[] = [];
+    const notices: Job[] = [];
     for (const job of [...pending]) {
-      // Collected (by a shell_status read) since it was queued — never send it.
       if (job.delivered) {
         pending.delete(job);
         continue;
       }
-      // An active shell_status wait will return and collect this job itself.
+      // A status wait will collect the result itself. Do not nudge it or send
+      // its result twice, including when another tool finishes in parallel.
       if (awaited(job)) continue;
-      pending.delete(job);
-      job.delivered = true;
-      registry?.persist(job);
-      deliver(job);
+      if (phase !== "turn" || job.delivery === "steer") {
+        if (phase === "followUp") entries.push({ type: "custom_message", ...resultMessage(job) });
+        else deliver(job);
+        job.delivered = true;
+        job.deliveredAt ??= Date.now();
+        pending.delete(job);
+        registry?.persist(job);
+        renderWidget();
+      } else if (job.delivery === "notify" && !job.notified) {
+        notices.push(job);
+      }
     }
+    if (notices.length > 0) {
+      // Batch ready jobs into one short steering message. This is not full
+      // delivery and is never repeated just because the agent did not collect.
+      pi.sendMessage({
+        customType: READY_TYPE,
+        content: readyMessage(notices.map((job) => job.id)),
+        display: true,
+        details: { ids: notices.map((job) => job.id) },
+      }, { deliverAs: "steer", triggerTurn: true });
+      for (const job of notices) {
+        job.notified = true;
+        registry?.persist(job);
+      }
+    }
+    return entries;
   }
 
   /** Deliver a finished background job into the conversation, once. */
@@ -279,7 +304,7 @@ export default function shellBackground(pi: ExtensionAPI) {
   }
 
   async function runBash(
-    params: { command: string; timeout?: number; background?: boolean },
+    params: { command: string; timeout?: number; background?: boolean; delivery?: DeliveryMode },
     signal: AbortSignal | undefined,
     onUpdate: ((r: ToolResult) => void) | undefined,
     ctx: UiContext,
@@ -292,6 +317,9 @@ export default function shellBackground(pi: ExtensionAPI) {
     // Match Pi's timeout validation and do not start an already-cancelled call.
     if (params.timeout !== undefined && (!Number.isFinite(params.timeout) || params.timeout <= 0 || params.timeout * 1000 > 2_147_483_647)) {
       throw new Error("Invalid timeout: must be positive, finite, and at most 2147483.647 seconds");
+    }
+    if (params.delivery !== undefined && !isDeliveryMode(params.delivery)) {
+      throw new Error("Invalid delivery: use notify, steer, or followUp");
     }
     if (signal?.aborted) throw new Error("aborted");
 
@@ -307,7 +335,7 @@ export default function shellBackground(pi: ExtensionAPI) {
       };
     }
 
-    const execution = owner.createExecution(command, ctx.cwd);
+    const execution = owner.createExecution(command, ctx.cwd, params.delivery);
     let job: Job | undefined;
     let spawned;
     try {
@@ -361,6 +389,7 @@ export default function shellBackground(pi: ExtensionAPI) {
         elapsedMs: fromForeground ? Date.now() - execution.startedAt : 0,
         fromForeground,
         deliverResults: settings.deliverResults,
+        delivery: job.delivery,
         interactive: ctx.hasUI,
         collectWith: "shell_status",
       });
@@ -429,7 +458,7 @@ export default function shellBackground(pi: ExtensionAPI) {
       `Await prerequisite results before depending on them, whether returned directly, delivered automatically, or collected with shell_status {id, wait: N}. ` +
       (!hasUI
         ? `This is a headless run: nothing is delivered after your turn, so collect background results within this same turn.`
-        : `The user can transfer a running foreground call with /bg, optionally adding steering instructions. A running job is not a successful result.`);
+        : `Choose how background completion reaches you: by default, one short notice during your work, then full output when you finish unless collected first; choose steer for full output sooner, or followUp for full output later without a notice. The user can transfer a running foreground call with /bg, optionally adding steering instructions. A running job is not a successful result.`);
     const guidelines = [
       ...(Array.isArray((original as { promptGuidelines?: unknown }).promptGuidelines)
         ? ((original as { promptGuidelines?: string[] }).promptGuidelines as string[])
@@ -446,7 +475,7 @@ export default function shellBackground(pi: ExtensionAPI) {
         `arrived; a long output is shown as its last ${Math.round(settings.tailBytes / 1024)}KB with the path of the ` +
         `full log. Foreground calls wait for completion; they never background automatically. ` +
         `Prefer background:true for servers, watchers, and work independent of your next action; it returns a job id immediately. ` +
-        `Await prerequisite results before depending on them. Optionally provide a timeout in seconds.`,
+        `Await prerequisite results before depending on them. The optional delivery setting controls when completion is reported. Optionally provide a timeout in seconds.`,
       parameters: Type.Object({
         command: Type.String({ description: "Shell command to execute" }),
         timeout: Type.Optional(
@@ -455,6 +484,11 @@ export default function shellBackground(pi: ExtensionAPI) {
         background: Type.Optional(
           Type.Boolean({ description: "Return a job id immediately. Use for servers/watchers or work independent of your next action. Await completion, delivered automatically or collected with shell_status, before relying on its result." }),
         ),
+        delivery: Type.Optional(Type.Union([
+          Type.Literal("notify", { description: "Tell me once that the result is ready while I work; send full output when I finish unless I collect it first. Default." }),
+          Type.Literal("steer", { description: "Give me the full result at the next safe opportunity, even while I am working." }),
+          Type.Literal("followUp", { description: "Let me finish my current work, then give me the full result, without an earlier notice." }),
+        ], { description: "How to report completion if this command is backgrounded, including later via /bg. Default: notify. All choices deliver the full result immediately if I am idle. Automatic delivery must be enabled.", default: "notify" })),
       }),
       promptGuidelines: guidelines,
       // pi 0.99: scripts and ctx.executeTool() callers receive structuredContent
@@ -516,8 +550,10 @@ export default function shellBackground(pi: ExtensionAPI) {
       // setting delivered here would permanently cancel the promised delivery.
       if (isFinished(job)) {
         job.delivered = true;
+        job.deliveredAt ??= Date.now();
         pending.delete(job);
         registry.persist(job);
+        renderWidget();
       }
       return {
         content: [{ type: "text", text: formatResult(job, settings.tailBytes) }],
@@ -645,11 +681,21 @@ export default function shellBackground(pi: ExtensionAPI) {
     timer.unref?.();
   }
 
-  // All tool results are recorded here, before the next model request. Flush
-  // even while ctx.isIdle() is false: this is a safe boundary within the run.
+  // Only interrupt ongoing work at a safe tool-batch boundary, with either
+  // explicitly requested full output or a one-time availability notice.
   pi.on("turn_end", async (_event, ctx) => {
     lastUiCtx = ctx;
-    drainDeliveries();
+    drainDeliveries(ctx.isIdle() ? "idle" : "turn");
+  });
+
+  // The agent would otherwise stop: append only results still uncollected
+  // now and request a follow-up response. Boundary entries avoid irrevocably
+  // queueing output earlier that a later status read might collect first.
+  // This hook tracks no activity state; ctx.isIdle() remains authoritative.
+  pi.on("agent_before_settle", async (event, ctx) => {
+    lastUiCtx = ctx;
+    const entries = drainDeliveries("followUp");
+    if (entries.length > 0) return { entries: [...event.entries, ...entries], continue: true };
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -662,6 +708,11 @@ export default function shellBackground(pi: ExtensionAPI) {
     registerBash(ctx.cwd, ctx.hasUI);
     renderWidget(ctx);
     adoptRunning(ctx);
+    // Completed-but-uncollected results also survive reloads, including jobs
+    // whose one-time notice was already sent by the previous instance.
+    for (const job of registry.all()) {
+      if (isFinished(job) && job.status !== "orphaned") enqueueDelivery(job);
+    }
     if (warnings.length > 0 && ctx.hasUI) ctx.ui.notify(`shell-background settings: ${warnings.join("; ")}`, "warning");
   });
 

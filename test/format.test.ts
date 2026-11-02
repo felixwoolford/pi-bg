@@ -20,6 +20,8 @@ function job(over: Partial<Job> = {}): Job {
     endedAt: 5200,
     background: true,
     fromForeground: false,
+    delivery: "notify",
+    notified: false,
     delivered: false,
     ...over,
   };
